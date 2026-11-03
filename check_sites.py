@@ -7,6 +7,8 @@ Emails a report. Fast: pages are checked in parallel.
 import os
 import re
 import smtplib
+import threading
+from itertools import zip_longest
 import ssl
 import sys
 import time
@@ -21,9 +23,11 @@ from bs4 import BeautifulSoup
 
 # ----------------------------- settings ------------------------------------
 TIMEOUT = 20               # seconds per request
-RETRIES = 1                # extra attempt before marking a page failed
+RETRIES = 2                # extra attempts before marking a page failed
 MIN_VISIBLE_TEXT = 80      # fewer visible characters than this = "white screen"
-WORKERS = 30               # pages checked in parallel (lower it if your hosting struggles)
+WORKERS = 30               # total pages checked in parallel
+PER_SITE = int(os.getenv("PER_SITE", "4"))               # max simultaneous requests to ONE website (prevents 503 overload/rate-limit)
+RETRY_STATUS = (429, 502, 503, 504)
 SLOW_SECONDS = 15
 MAX_LISTED_PER_SITE = 100  # keeps the email readable if a lot of pages fail
 
@@ -41,26 +45,41 @@ ERROR_SIGNATURES = [
 ]
 
 session = requests.Session()
-session.headers.update({"User-Agent": "Mozilla/5.0 (compatible; SiteMonitorBot/1.0)"})
+session.headers.update({
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-AU,en;q=0.9",
+})
+site_locks = {}
 adapter = HTTPAdapter(pool_connections=WORKERS, pool_maxsize=WORKERS * 2)
 session.mount("http://", adapter)
 session.mount("https://", adapter)
 
 
 def fetch(url, retries=RETRIES):
-    last_err = None
-    for _ in range(retries + 1):
+    last_err, r = None, None
+    for attempt in range(retries + 1):
         start = time.time()
         try:
             r = session.get(url, timeout=TIMEOUT, allow_redirects=True)
+            if r.status_code in RETRY_STATUS and attempt < retries:
+                wait = r.headers.get("Retry-After", "")
+                time.sleep(min(int(wait), 20) if wait.isdigit() else 4 * (attempt + 1))
+                continue
             return r, None, time.time() - start
         except requests.RequestException as e:
             last_err = f"{type(e).__name__}: {str(e)[:120]}"
-            time.sleep(1)
+            time.sleep(2)
     return None, last_err, 0
 
 
 def check_page(url):
+    site = "{0.scheme}://{0.netloc}".format(urlparse(url))
+    with site_locks[site]:
+        return _check_page(url)
+
+
+def _check_page(url):
     r, err, secs = fetch(url)
     if r is None:
         return {"url": url, "ok": False, "problem": f"No response ({err})"}
@@ -104,7 +123,9 @@ def send_email(subject, body):
 
 
 def load_pages():
-    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pages.txt")
+    # usage: python check_sites.py pages/mysite.txt   (defaults to pages.txt)
+    path = sys.argv[1] if len(sys.argv) > 1 else os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "pages.txt")
     with open(path, encoding="utf-8") as f:
         urls = [l.strip() for l in f if l.strip() and not l.strip().startswith("#")]
     seen, out = set(), []
@@ -122,6 +143,8 @@ def main():
         p = urlparse(u)
         sites.setdefault(f"{p.scheme}://{p.netloc}", []).append(u)
 
+    for site in sites:
+        site_locks[site] = threading.BoundedSemaphore(PER_SITE)
     started = time.time()
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
@@ -136,7 +159,8 @@ def main():
                 down[site] = err
 
     # 2) Check all pages of the reachable sites in one big parallel pool
-    todo = [u for site, pages in sites.items() if site not in down for u in pages]
+    lists = [pages for site, pages in sites.items() if site not in down]
+    todo = [u for group in zip_longest(*lists) for u in group if u]   # interleave sites
     with ThreadPoolExecutor(max_workers=WORKERS) as ex:
         results = list(ex.map(check_page, todo))
     by_url = {r["url"]: r for r in results}
@@ -160,16 +184,17 @@ def main():
             report.append(f"    ... and {len(bad) - MAX_LISTED_PER_SITE} more (see GitHub Actions log)")
         report.append("")
 
+    names = ", ".join(urlparse(x).netloc for x in sites)
     took = int(time.time() - started)
     body = (f"Website check at {now} (took {took}s)\n"
             f"Total pages: {len(urls)}\nTotal problems: {problems}\n\n" + "\n".join(report))
 
     if problems:
-        send_email(f"ALERT: {problems} website problem(s) found", body)
+        send_email(f"ALERT: {problems} problem(s) on {names}", body)
         print("Alert email sent.")
         sys.exit(1)
     elif os.getenv("SEND_OK_EMAIL", "false").lower() == "true":
-        send_email("All websites are working", body)
+        send_email(f"OK: {names} is working", body)
         print("OK email sent.")
     else:
         print("All good. No email sent.")
