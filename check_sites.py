@@ -21,11 +21,11 @@ import requests
 from bs4 import BeautifulSoup
 
 # ----------------------------- settings ------------------------------------
-TIMEOUT = 25                 # seconds per request
-RETRIES = 2                  # extra attempts before a page is marked failed
+TIMEOUT = 20                 # seconds per request
+RETRIES = 1                  # extra attempts before a page is marked failed
 MIN_VISIBLE_TEXT = 80        # fewer visible characters than this = "white screen"
 MAX_PAGES_PER_SITE = 300     # safety limit for crawling
-WORKERS = 8
+WORKERS = 16
 USER_AGENT = "Mozilla/5.0 (compatible; SiteMonitorBot/1.0; +https://github.com)"
 
 ERROR_SIGNATURES = [
@@ -138,9 +138,9 @@ def discover_pages(site):
     return pages, source
 
 
-def load_extra_urls():
-    """Optional: extra URLs you want checked, one per line in extra_urls.txt."""
-    path = os.path.join(os.path.dirname(__file__), "extra_urls.txt")
+def load_manual_pages():
+    """If pages.txt has URLs for a site, discovery is skipped (much faster)."""
+    path = os.path.join(os.path.dirname(__file__), "pages.txt")
     if not os.path.exists(path):
         return []
     with open(path) as f:
@@ -202,12 +202,26 @@ def main():
     with open(sites_file) as f:
         sites = [l.strip() for l in f if l.strip() and not l.startswith("#")]
 
+    if "--discover" in sys.argv:
+        # One-time helper: builds pages.txt so later runs skip slow discovery
+        with open(os.path.join(os.path.dirname(__file__), "pages.txt"), "w") as out:
+            for site in sites:
+                pages, source = discover_pages(site)
+                print(f"{site}: {len(pages)} pages via {source}")
+                out.write(f"# {site}\n" + "\n".join(pages) + "\n\n")
+        print("pages.txt written. Commit it to your repo.")
+        return
+
+    manual = load_manual_pages()
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     report, failures, total = [], 0, 0
 
     for site in sites:
-        pages, source = discover_pages(site)
-        pages = sorted(set(pages + [normalize(u) for u in load_extra_urls() if same_host(u, site)]))
+        mine = [normalize(u) for u in manual if same_host(u, site)]
+        if mine:
+            pages, source = sorted(set(mine + [normalize(site)])), "pages.txt"
+        else:
+            pages, source = discover_pages(site)
         with ThreadPoolExecutor(max_workers=WORKERS) as ex:
             results = list(ex.map(check_page, pages))
         bad = [r for r in results if not r["ok"]]
