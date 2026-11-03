@@ -4,6 +4,15 @@ on:
   # No GitHub "schedule" here on purpose: an external cron job (cron-job.org) starts this
   # workflow every hour through the GitHub API, so you never get duplicate emails.
   workflow_dispatch:
+    inputs:
+      diagnose_url:
+        description: "Optional: inspect ONE url (what the runner is really served) and stop"
+        required: false
+        default: ""
+      force_email:
+        description: "Send the email even if this hour already sent one"
+        type: boolean
+        default: false
 
 concurrency:
   group: site-monitor
@@ -13,7 +22,7 @@ jobs:
   check:
     name: check ${{ matrix.site }}
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     strategy:
       fail-fast: false            # one site failing never stops the others
       matrix:
@@ -33,12 +42,28 @@ jobs:
           cache: pip
 
       - name: Install dependencies
-        run: pip install requests beautifulsoup4
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # Needed only for the pages that look empty over plain HTTP: they are re-checked
+      # in a real browser so JavaScript-rendered pages are not called white screens.
+      - name: Install headless Chromium
+        run: playwright install --with-deps chromium
+
+      - name: Diagnose one URL (manual runs only)
+        if: ${{ inputs.diagnose_url != '' }}
+        env:
+          DIAGNOSE_URL: ${{ inputs.diagnose_url }}
+        run: python check_sites.py pages.txt ${{ matrix.site }} --diagnose
 
       - name: Check ${{ matrix.site }}
+        if: ${{ inputs.diagnose_url == '' }}
         env:
           REPORT_DIR: reports         # save results instead of emailing from each job
           PER_SITE: "6"               # simultaneous requests to this site
+          USE_BROWSER: "true"         # set to "false" to skip browser verification
+          BROWSER_WORKERS: "2"        # parallel browsers for the re-check
         run: python check_sites.py pages.txt ${{ matrix.site }}
 
       - name: Save report
@@ -55,6 +80,9 @@ jobs:
     if: always()                  # send the email even if some site checks failed
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    permissions:
+      actions: read          # lets combine_report.py ask GitHub if an earlier run already emailed
+      contents: read
     steps:
       - uses: actions/checkout@v4
 
@@ -73,4 +101,6 @@ jobs:
           MAIL_TO: ${{ secrets.MAIL_TO }}
           SEND_OK_EMAIL: "true"       # "false" = email only when something is broken
           EXPECTED: "scrapcarremovalqld.com.au,5starcashforcars.com.au,instantcarremoval.com.au,instantcarremovalsydney.com.au,instantcarremovalqld.com.au,icarpetcleanandpestcontrol.com.au"
-        run: python combine_report.py
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DEDUPE_HOUR: "true"      # at most one email per hour, even if the workflow is triggered twice
+        run: python combine_report.py ${{ inputs.force_email && '--force' || '' }}
