@@ -33,11 +33,40 @@ jobs:
 
       - name: Check ${{ matrix.site }}
         env:
+          REPORT_DIR: reports         # save results instead of emailing from each job
+          PER_SITE: "6"               # simultaneous requests to this site
+        run: python check_sites.py pages.txt ${{ matrix.site }}
+
+      - name: Save report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: report-${{ matrix.site }}
+          path: reports/
+          if-no-files-found: ignore
+
+  email:
+    name: send combined email
+    needs: check
+    if: always()                  # send the email even if some site checks failed
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: report-*
+          path: reports
+          merge-multiple: true
+
+      - name: Send one email with all sites
+        env:
           SMTP_HOST: smtp.gmail.com
           SMTP_PORT: "465"
           SMTP_USER: ${{ secrets.SMTP_USER }}
           SMTP_PASS: ${{ secrets.SMTP_PASS }}
           MAIL_TO: ${{ secrets.MAIL_TO }}
           SEND_OK_EMAIL: "true"       # "false" = email only when something is broken
-          PER_SITE: "6"               # simultaneous requests to this site
-        run: python check_sites.py pages.txt ${{ matrix.site }}
+          EXPECTED: "scrapcarremovalqld.com.au,5starcashforcars.com.au,instantcarremoval.com.au,instantcarremovalsydney.com.au,instantcarremovalqld.com.au,icarpetcleanandpestcontrol.com.au"
+        run: python combine_report.py
