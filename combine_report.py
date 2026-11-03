@@ -1,12 +1,39 @@
 #!/usr/bin/env python3
-"""Reads the per-site results saved by each check job and sends ONE combined email."""
+"""Reads the per-site results saved by each check job and sends ONE combined email.
+
+DUPLICATE-EMAIL GUARD
+---------------------
+You trigger this workflow from cron-job.org. If anything makes it start twice in the
+same hour - a retry from the cron service, a double trigger, a manual re-run after a
+failure, two cron entries - two runs would each send an email.
+
+Before sending, this script asks GitHub whether an EARLIER run in the same hour
+already completed its "send combined email" job successfully. If one did, this run
+prints that and exits without emailing. So you get exactly one email per hour, always
+from the first run of that hour.
+
+It fails safe: if the GitHub API cannot be asked (no token, rate limit, network), the
+email is sent rather than silently skipped.
+
+Environment (all provided by GitHub Actions automatically):
+    GITHUB_TOKEN, GITHUB_REPOSITORY, GITHUB_RUN_ID, GITHUB_API_URL
+Set DEDUPE_HOUR=false to turn the guard off; pass --force to send anyway.
+"""
 import glob
 import json
 import os
 import smtplib
 import ssl
+import sys
+import urllib.error
+import urllib.request
 from datetime import datetime, timezone
 from email.mime.text import MIMEText
+
+EMAIL_JOB_NAME = "send combined email"      # must match the job name in the workflow
+# Runs are grouped by the clock hour they started in (UTC). A run repeated inside the
+# same hour is a duplicate; a run in a new hour is a new report - even if the previous
+# one started only 59 minutes ago. That avoids skipping a legitimate hourly email.
 
 
 def send_email(subject, body):
@@ -21,7 +48,90 @@ def send_email(subject, body):
         s.sendmail(user, to, msg.as_string())
 
 
+# ---------------------------------------------------------------------------
+# duplicate-run detection
+# ---------------------------------------------------------------------------
+def _api(path):
+    """GET a GitHub API path, return parsed JSON. Raises on failure."""
+    base = os.getenv("GITHUB_API_URL", "https://api.github.com")
+    token = os.environ["GITHUB_TOKEN"]
+    req = urllib.request.Request(
+        base + path,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "User-Agent": "site-working-check",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=20) as r:
+        return json.load(r)
+
+
+def email_already_sent_this_hour():
+    """True when an earlier run in the last hour already delivered the email.
+
+    Returns (bool, reason_string).
+    """
+    repo = os.getenv("GITHUB_REPOSITORY")
+    run_id = os.getenv("GITHUB_RUN_ID")
+    if not (repo and run_id and os.getenv("GITHUB_TOKEN")):
+        return False, "not running on GitHub Actions - dedupe skipped"
+
+    try:
+        my_run_id = int(run_id)
+
+        # Which hour does MY run belong to? Use the run's own start time, not "now",
+        # so a long check that finishes in the next hour is still grouped correctly.
+        started = datetime.now(timezone.utc)
+        try:
+            mine = _api(f"/repos/{repo}/actions/runs/{my_run_id}")
+            if mine.get("created_at"):
+                started = datetime.strptime(mine["created_at"], "%Y-%m-%dT%H:%M:%SZ").replace(
+                    tzinfo=timezone.utc)
+        except Exception:
+            pass
+        hour_start = started.replace(minute=0, second=0, microsecond=0)
+        since = hour_start.strftime("%Y-%m-%dT%H:%M:%SZ")
+        runs = _api(f"/repos/{repo}/actions/runs?created=%3E%3D{since}&per_page=100").get(
+            "workflow_runs", [])
+
+        # Only runs that started inside MY hour, and only older ones. Verified locally
+        # as well as with the API filter: never rely on a server-side filter alone for
+        # a decision that decides whether an alert email is sent.
+        earlier = []
+        for r in runs:
+            rid = int(r.get("id", 0))
+            created = r.get("created_at") or ""
+            if rid >= my_run_id:
+                continue
+            if not created or created < since:      # ISO-8601 Z timestamps sort as strings
+                continue
+            earlier.append(r)
+        earlier.sort(key=lambda r: int(r.get("id", 0)))
+
+        for r in earlier:
+            if r.get("status") != "completed":
+                # still running: it may send the email itself, we cannot know yet.
+                continue
+            jobs = _api(f"/repos/{repo}/actions/runs/{r['id']}/jobs?per_page=100").get("jobs", [])
+            for job in jobs:
+                if job.get("name") == EMAIL_JOB_NAME and job.get("conclusion") == "success":
+                    return True, (f"run {r['id']} ({r.get('created_at', '?')}) already sent "
+                                  f"the email for this hour")
+    except Exception as e:
+        return False, (f"could not check for duplicates ({type(e).__name__}: {str(e)[:100]})"
+                       " - sending anyway")
+
+    if not earlier:
+        return False, "first run of this hour"
+    return False, f"no earlier run of this hour ({hour_start:%H}:00 UTC) sent an email"
+
+
+# ---------------------------------------------------------------------------
 def main():
+    force = "--force" in sys.argv
+
     reports = {}
     for path in glob.glob("reports/*.json"):
         with open(path, encoding="utf-8") as f:
@@ -54,13 +164,33 @@ def main():
         body += "\nDETAILS\n\n" + "\n".join(details)
 
     if total_problems:
-        send_email(f"ALERT: {total_problems} problem(s) across your websites", body)
-        print("Combined alert email sent.")
-    elif os.getenv("SEND_OK_EMAIL", "false").lower() == "true":
-        send_email("OK: all websites are working", body)
-        print("Combined OK email sent.")
+        subject = f"ALERT: {total_problems} problem(s) across your websites"
     else:
-        print("All good. No email sent.")
+        subject = "OK: all websites are working"
+        if os.getenv("SEND_OK_EMAIL", "false").lower() != "true":
+            print("All good. No email sent (SEND_OK_EMAIL is not true).")
+            return
+
+    # --- duplicate guard ---------------------------------------------------
+    if not force and os.getenv("DEDUPE_HOUR", "true").lower() != "false":
+        already, reason = email_already_sent_this_hour()
+        if already:
+            print(f"Duplicate email prevented: {reason}.")
+            print("This run did not send anything. Re-run with --force to override.")
+            return
+        print(f"Dedupe check: {reason}.")
+    # -----------------------------------------------------------------------
+
+    try:
+        send_email(subject, body)
+        print(f"Email sent: {subject}")
+    except KeyError as e:
+        print(f"Email not sent: missing environment variable {e} "
+              f"(set SMTP_USER, SMTP_PASS and MAIL_TO).")
+        print("\n------------ report ------------\n" + body + "\n-------------------------------")
+    except Exception as e:
+        print(f"Email not sent: {type(e).__name__}: {str(e)[:200]}")
+        print("\n------------ report ------------\n" + body + "\n-------------------------------")
 
 
 if __name__ == "__main__":
