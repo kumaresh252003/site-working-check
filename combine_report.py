@@ -36,6 +36,17 @@ EMAIL_JOB_NAME = "send combined email"      # must match the job name in the wor
 # one started only 59 minutes ago. That avoids skipping a legitimate hourly email.
 
 
+def write_step_summary(markdown):
+    """Write to the GitHub job summary: visible on the run page, no log digging."""
+    path = os.getenv("GITHUB_STEP_SUMMARY")
+    if path:
+        try:
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(markdown.rstrip() + "\n")
+        except Exception:
+            pass
+
+
 def send_email(subject, body):
     host = os.getenv("SMTP_HOST", "smtp.gmail.com")
     port = int(os.getenv("SMTP_PORT", "465"))
@@ -188,6 +199,7 @@ def main():
         subject = "OK: all websites are working"
         if os.getenv("SEND_OK_EMAIL", "false").lower() != "true":
             print("All good. No email sent (SEND_OK_EMAIL is not true).")
+            write_step_summary("## Email: not sent\nNo problems found and `SEND_OK_EMAIL` is not true.")
             return
 
     # --- duplicate guard ---------------------------------------------------
@@ -196,20 +208,41 @@ def main():
         if already:
             print(f"Duplicate email prevented: {reason}.")
             print("This run did not send anything. Re-run with --force to override.")
+            write_step_summary(f"## Email: skipped (duplicate)\n{reason}\n\n"
+                    f"Set `DEDUPE_HOUR: \"false\"` or run with `force_email = true` to send anyway.")
             return
         print(f"Dedupe check: {reason}.")
     # -----------------------------------------------------------------------
 
+    recipient = os.getenv("MAIL_TO", "(MAIL_TO not set)")
     try:
         send_email(subject, body)
         print(f"Email sent: {subject}")
+        print(f"  from {os.getenv('SMTP_USER', '?')} to {recipient}")
+        write_step_summary(f"## Email: sent\n**{subject}**\n\nFrom `{os.getenv('SMTP_USER', '?')}` "
+                f"to `{recipient}` via {os.getenv('SMTP_HOST', 'smtp.gmail.com')}.")
     except KeyError as e:
         print(f"Email not sent: missing environment variable {e} "
               f"(set SMTP_USER, SMTP_PASS and MAIL_TO).")
         print("\n------------ report ------------\n" + body + "\n-------------------------------")
+        write_step_summary(f"## Email: FAILED\nMissing secret `{e}`. Add it under "
+                "**Settings -> Secrets and variables -> Actions**.")
+        sys.exit(1)
     except Exception as e:
         print(f"Email not sent: {type(e).__name__}: {str(e)[:200]}")
         print("\n------------ report ------------\n" + body + "\n-------------------------------")
+        hint = ""
+        msg = str(e).lower()
+        if "authentication" in msg or "535" in msg or "credentials" in msg:
+            hint = ("Gmail rejected the login: `SMTP_PASS` must be a 16-character **App "
+                    "Password** (Google Account -> Security -> 2-Step Verification -> App "
+                    "passwords), not your normal password.")
+        elif "quota" in msg or "limit" in msg:
+            hint = "Gmail sending limit reached for today."
+        elif "timed out" in msg or "timeout" in msg or "disconnected" in msg:
+            hint = "The SMTP connection was blocked or timed out (port 465)."
+        write_step_summary(f"## Email: FAILED\n`{type(e).__name__}: {str(e)[:200]}`\n\n{hint}")
+        sys.exit(1)
 
 
 if __name__ == "__main__":
