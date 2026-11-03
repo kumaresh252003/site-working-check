@@ -9,8 +9,12 @@ on:
         description: "Optional: inspect ONE url (what the runner is really served) and stop"
         required: false
         default: ""
+      test_email:
+        description: "Send a single test email to check the SMTP secrets, then stop"
+        type: boolean
+        default: false
       force_email:
-        description: "Send the email even if this hour already sent one"
+        description: "Send the report email even if this hour already sent one"
         type: boolean
         default: false
 
@@ -42,13 +46,15 @@ jobs:
           cache: pip
 
       - name: Install dependencies
+        if: ${{ inputs.diagnose_url == '' && !inputs.test_email }}
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # Needed only for the pages that look empty over plain HTTP: they are re-checked
-      # in a real browser so JavaScript-rendered pages are not called white screens.
+      # Needed only for pages that look empty over plain HTTP: they are re-checked in a
+      # real browser so JavaScript-rendered pages are not called white screens.
       - name: Install headless Chromium
+        if: ${{ inputs.diagnose_url == '' && !inputs.test_email }}
         run: playwright install --with-deps chromium
 
       - name: Diagnose one URL (manual runs only)
@@ -58,12 +64,15 @@ jobs:
         run: python check_sites.py pages.txt ${{ matrix.site }} --diagnose
 
       - name: Check ${{ matrix.site }}
-        if: ${{ inputs.diagnose_url == '' }}
+        if: ${{ inputs.diagnose_url == '' && !inputs.test_email }}
         env:
           REPORT_DIR: reports         # save results instead of emailing from each job
-          PER_SITE: "6"               # simultaneous requests to this site
+          PER_SITE: "3"               # simultaneous requests to this site (keep it low:
+                                      #  high values make the host answer 503 to everyone)
           USE_BROWSER: "true"         # set to "false" to skip browser verification
-          BROWSER_WORKERS: "2"        # parallel browsers for the re-check
+          BROWSER_WORKERS: "1"        # one browser at a time - gentlest option
+          MAX_BROWSER_CHECKS: "12"    # how many suspicious pages get a browser check
+          TRANSIENT_PAUSE: "30"       # pause before re-checking pages that answered 5xx
         run: python check_sites.py pages.txt ${{ matrix.site }}
 
       - name: Save report
@@ -81,18 +90,40 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
-      actions: read          # lets combine_report.py ask GitHub if an earlier run already emailed
+      actions: read               # lets combine_report.py ask GitHub if an earlier run emailed
       contents: read
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Download reports
+        if: ${{ !inputs.test_email }}
+        continue-on-error: true   # a missing artifact must not kill the email job silently
+        uses: actions/download-artifact@v4
         with:
           pattern: report-*
           path: reports
           merge-multiple: true
 
+      - name: List what was received
+        if: ${{ !inputs.test_email }}
+        run: ls -la reports/ || echo "NO REPORTS DOWNLOADED"
+
+      - name: Send test email (manual runs only)
+        if: ${{ inputs.test_email }}
+        env:
+          SMTP_HOST: smtp.gmail.com
+          SMTP_PORT: "465"
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          MAIL_TO: ${{ secrets.MAIL_TO }}
+        run: python combine_report.py --test
+
       - name: Send one email with all sites
+        if: ${{ !inputs.test_email }}
         env:
           SMTP_HOST: smtp.gmail.com
           SMTP_PORT: "465"
@@ -102,5 +133,5 @@ jobs:
           SEND_OK_EMAIL: "true"       # "false" = email only when something is broken
           EXPECTED: "scrapcarremovalqld.com.au,5starcashforcars.com.au,instantcarremoval.com.au,instantcarremovalsydney.com.au,instantcarremovalqld.com.au,icarpetcleanandpestcontrol.com.au"
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          DEDUPE_HOUR: "true"      # at most one email per hour, even if the workflow is triggered twice
+          DEDUPE_HOUR: "true"         # at most one email per hour, even if triggered twice
         run: python combine_report.py ${{ inputs.force_email && '--force' || '' }}
