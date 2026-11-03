@@ -1,0 +1,35 @@
+name: Website Monitor
+
+on:
+  schedule:
+    - cron: "0 * * * *"          # every 1 hour
+  workflow_dispatch:            # lets you run it manually from the Actions tab
+
+concurrency:
+  group: site-monitor
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install requests beautifulsoup4
+
+      - name: Check websites
+        env:
+          SMTP_HOST: smtp.gmail.com
+          SMTP_PORT: "465"
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          MAIL_TO: ${{ secrets.MAIL_TO }}
+          SEND_OK_EMAIL: "true"       # email every run, even when all is fine
+        run: python check_sites.py
