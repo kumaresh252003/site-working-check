@@ -132,6 +132,25 @@ def email_already_sent_this_hour():
 def main():
     force = "--force" in sys.argv
 
+    # --test: prove that SMTP_USER / SMTP_PASS / MAIL_TO work, without waiting for an
+    # hourly run. Used by the "test_email" input of the workflow.
+    if "--test" in sys.argv:
+        to = os.getenv("MAIL_TO", "(MAIL_TO not set)")
+        try:
+            send_email("TEST: website monitor email",
+                       "Test email from the website monitor.\n\n"
+                       "If you received this, SMTP_USER, SMTP_PASS and MAIL_TO are correct "
+                       "and the hourly reports will arrive too.")
+            print(f"Test email sent from {os.getenv('SMTP_USER', '?')} to {to}")
+        except KeyError as e:
+            print(f"Test FAILED: environment variable {e} is missing in this job.")
+            print("Add it under Settings -> Secrets and variables -> Actions.")
+        except Exception as e:
+            print(f"Test FAILED: {type(e).__name__}: {e}")
+            print("Common causes: wrong app password, Gmail 2FA off, MAIL_TO empty, "
+                  "SMTP port blocked.")
+        return
+
     reports = {}
     for path in glob.glob("reports/*.json"):
         with open(path, encoding="utf-8") as f:
