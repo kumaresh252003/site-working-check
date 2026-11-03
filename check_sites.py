@@ -76,8 +76,11 @@ MAX_LISTED_PER_SITE = 100  # keeps the email readable if a lot of pages fail
 
 # Browser verification (only used for pages that look empty over plain HTTP)
 USE_BROWSER = os.getenv("USE_BROWSER", "true").lower() != "false"
-MAX_BROWSER_CHECKS = int(os.getenv("MAX_BROWSER_CHECKS", "40"))  # per site and run
-BROWSER_WORKERS = int(os.getenv("BROWSER_WORKERS", "2"))
+MAX_BROWSER_CHECKS = int(os.getenv("MAX_BROWSER_CHECKS", "12"))  # per site and run (sampling is enough)
+BROWSER_WORKERS = int(os.getenv("BROWSER_WORKERS", "1"))
+BROWSER_PAUSE = float(os.getenv("BROWSER_PAUSE", "0.4"))   # seconds between browser checks
+MAX_TRANSIENT_RETRIES = int(os.getenv("MAX_TRANSIENT_RETRIES", "10"))
+TRANSIENT_PAUSE = int(os.getenv("TRANSIENT_PAUSE", "30"))  # seconds before re-checking 5xx pages
 BROWSER_TIMEOUT = 45000    # ms
 SETTLE_SECONDS = 3.0       # how long to watch the page until the text stops growing
 NAV_TIMEOUT = 45
@@ -136,10 +139,41 @@ BLOCK_SIGNATURES = [
     "maintenance mode",
     "not acceptable",
     "the request could not be satisfied",
+    # 5xx / overload pages: the server answered, it just could not serve the page
+    "503 service",
+    "service unavailable",
+    "service temporarily unavailable",
+    "temporarily unavailable",
+    "500 internal server error",
+    "502 bad gateway",
+    "504 gateway",
+    "gateway time-out",
+    "the server is busy",
+    "server too busy",
+    "please try again later",
+    "try again later",
 ]
 
 # Never treated as visible page text (matches a browser's innerText behaviour closely enough).
 NON_TEXT_TAGS = ["script", "style", "noscript", "template", "svg", "canvas", "iframe"]
+
+# Text that only a 5xx error page contains. Deliberately strict: generic phrasing such
+# as "try again later" also appears in firewall notices, which are a different verdict.
+FATAL_5XX = (
+    "503 service",
+    "503 service unavailable",
+    "service unavailable",
+    "service temporarily unavailable",
+    "500 internal server error",
+    "internal server error",
+    "502 bad gateway",
+    "bad gateway",
+    "504 gateway",
+    "gateway time-out",
+    "gateway timeout",
+    "the server is busy",
+    "server too busy",
+)
 
 session = requests.Session()
 session.headers.update({
@@ -308,8 +342,17 @@ def _check_page(url):
     r, err, secs = fetch(url)
     if r is None:
         return {"url": url, "ok": False, "problem": f"No response ({err})", "suspect": False}
+    if r.status_code >= 500:
+        # The server answered but could not serve the page: usually the host throttling
+        # us (too many parallel requests), occasionally a real outage. Never call this a
+        # white screen without checking what a browser gets.
+        body = text_from_html(r.text or "")
+        return {"url": url, "ok": False, "suspect": True,
+                "http_sample": body[:200], "http_len": len(body), "http_status": r.status_code,
+                "problem": f"SERVER ERROR - HTTP {r.status_code} from the server"}
+
     if r.status_code >= 400:
-        # a 403/429/503 from a WAF gets the clearer wording
+        # a 403/429 from a WAF gets the clearer wording
         body = text_from_html(r.text or "")
         sig = find_signature(body, BLOCK_SIGNATURES)
         if sig or r.status_code in (403, 429, 503):
@@ -460,7 +503,7 @@ def browser_probe(url):
     return info
 
 
-def verify_with_browser(urls, label=""):
+def verify_with_browser(urls, label="", workers=None):
     """Render a batch of suspicious URLs. Returns {url: browser_probe result}.
 
     The URLs are split into one chunk per worker thread, because Playwright's
@@ -476,14 +519,16 @@ def verify_with_browser(urls, label=""):
         print("    Fix: pip install playwright && playwright install chromium")
         return {}
 
-    workers = max(1, min(BROWSER_WORKERS, len(urls)))
+    workers = max(1, min(workers or BROWSER_WORKERS, len(urls)))
     chunks = [urls[i::workers] for i in range(workers)]
     collected = {}
     lock = threading.Lock()
 
     def run_chunk(chunk):
         try:
-            for url in chunk:
+            for n, url in enumerate(chunk):
+                if n and BROWSER_PAUSE:
+                    time.sleep(BROWSER_PAUSE)
                 info = browser_probe(url)
                 with lock:
                     collected[url] = info
@@ -499,49 +544,85 @@ def verify_with_browser(urls, label=""):
 
 
 def resolve_suspect(result, probe):
-    """Turn an HTTP result + its browser probe into a final verdict."""
+    """Turn an HTTP result + its browser probe into a final verdict.
+
+    Every verdict carries the text that was measured, so the site-wide rule can still
+    recognise "the same short page on every URL" (WAF notice, rate limit, ...).
+    """
     url = result["url"]
     problem = result["problem"]
+    info = {"url": url,
+            "http_sample": result.get("http_sample", ""),
+            "http_len": result.get("http_len", 0)}
+    if result.get("http_status"):
+        info["http_status"] = result["http_status"]
+    if probe:
+        info["browser_sample"] = probe.get("sample", "")
+        info["browser_chars"] = probe.get("chars", 0)
 
     if probe and probe.get("error"):
         # browser could not load it at all - keep the HTTP wording, add the reason
-        return {"url": url, "ok": False,
-                "problem": f"{problem} (browser could not confirm: {probe['error'][:100]})"}
+        info["problem"] = f"{problem} (browser could not confirm: {probe['error'][:100]})"
+        info["ok"] = False
+        return info
 
     if probe:
         sample = probe.get("sample", "")
+        status = probe.get("status") or 0
         sig = find_signature(sample, BLOCK_SIGNATURES) or find_signature(problem, BLOCK_SIGNATURES)
+
+        # The site refused to serve the page (5xx) instead of serving an empty one.
+        # That is throttling/overload, not a white screen - the pages are usually fine.
+        http_status = result.get("http_status") or 0
+        five_xx = (status >= 500 or http_status >= 500
+                   or (sample and any(k in sample.lower() for k in FATAL_5XX)))
+        if five_xx:
+            info.update(ok=False, transient=True,
+                        problem=(f"OVERLOADED / RATE-LIMITED - the server answered HTTP "
+                                 f"{status or http_status or '5xx'} instead of the page "
+                                 f"(the host is throttling the checker, not broken content)"
+                                 + (f'. Server said: "{sample[:110]}"' if sample else "")))
+            return info
+
         if probe["chars"] >= MIN_VISIBLE_TEXT and not sig:
             # the page renders fine for a real browser: JS-rendered, not broken
-            return {"url": url, "ok": True, "problem": "", "js_rendered": True,
-                    "browser_sample": sample, "browser_chars": probe["chars"]}
+            info.update(ok=True, problem="", js_rendered=True)
+            return info
+
         if sig:
-            return {"url": url, "ok": False,
-                    "problem": (f"PROTECTED/BLOCKED - the server is returning a challenge page, "
-                                f"not your content (matched '{sig}'; {probe['chars']} chars visible). "
-                                f'Page said: "{sample[:110]}"')}
+            info.update(ok=False,
+                        problem=(f"PROTECTED/BLOCKED - the server is returning a challenge page, "
+                                 f"not your content (matched '{sig}'; {probe['chars']} chars "
+                                 f'visible). Page said: "{sample[:110]}"'))
+            return info
+
         if probe["chars"] >= MIN_VISIBLE_TEXT:
-            return {"url": url, "ok": True, "problem": "",
-                    "browser_sample": sample, "browser_chars": probe["chars"]}
-        if probe["chars"] == 0 and probe["status"] and probe["status"] >= 400:
-            return {"url": url, "ok": False,
-                    "problem": f"HTTP {probe['status']} in the browser (server refused the request)"}
-        return {"url": url, "ok": False, "browser_sample": sample, "browser_chars": probe["chars"],
-                "problem": (f"WHITE SCREEN - only {probe['chars']} characters of visible text "
-                            f"after rendering (browser confirmed; {probe['hidden']} chars hidden)"
-                            + (f'. Page said: "{sample[:110]}"' if sample else ""))}
+            info.update(ok=True, problem="")
+            return info
+
+        if probe["chars"] == 0 and status >= 400:
+            info.update(ok=False,
+                        problem=f"HTTP {status} in the browser (server refused the request)")
+            return info
+
+        info.update(ok=False,
+                    problem=(f"WHITE SCREEN - only {probe['chars']} characters of visible text "
+                             f"after rendering (browser confirmed; {probe['hidden']} chars hidden)"
+                             + (f'. Page said: "{sample[:110]}"' if sample else "")))
+        return info
 
     # no browser available: keep the honest HTTP verdict but say it is unconfirmed
-    return {"url": url, "ok": False,
-            "problem": f"{problem} (unconfirmed - not re-checked in a browser)"}
+    info.update(ok=False,
+                problem=f"{problem} (unconfirmed - not re-checked in a browser)")
+    return info
 
 
 def identical_short_cluster(pages, by_url, short_limit=600, min_pages=5, share=0.6):
     """Detect a site that answers every URL with the same short page.
 
     Returns {"sample": text, "count": n, "length": chars} or None.
-    Pages that a browser confirmed as real content (js_rendered) are ignored, so a
-    genuine single-page app is never mistaken for a notice page.
+    Pages a browser confirmed as real content (js_rendered) are ignored, so a genuine
+    JavaScript app is never mistaken for a notice page.
     """
     if len(pages) < min_pages:
         return None
@@ -757,6 +838,22 @@ def main():
                     for r in rest:
                         by_url[r["url"]] = {"url": r["url"], "ok": False,
                                             "problem": r["problem"] + " (not re-checked: sample limit)"}
+
+    # 3b) Second chance for pages the host refused to serve (5xx / throttling).
+    #     A monitoring tool must not report "broken page" for its own load spike:
+    #     wait, then ask those pages once more, one at a time.
+    transient = [r for r in by_url.values() if r.get("transient") and not r["ok"]]
+    if transient and USE_BROWSER:
+        retry = transient[:MAX_TRANSIENT_RETRIES]
+        print(f"Waiting {TRANSIENT_PAUSE}s, then re-checking {len(retry)} page(s) the host refused (5xx)...")
+        time.sleep(TRANSIENT_PAUSE)
+        probes = verify_with_browser([r["url"] for r in retry], workers=1)
+        for r in retry:
+            info = probes.get(r["url"]) or {}
+            if not info.get("error") and int(info.get("chars") or 0) >= MIN_VISIBLE_TEXT:
+                by_url[r["url"]] = {"url": r["url"], "ok": True, "problem": "",
+                                    "js_rendered": True, "browser_chars": info["chars"]}
+                print(f"    recovered after the pause: {r['url']}")
 
     # 4) Build the report
     report, problems = [], 0
