@@ -3,16 +3,23 @@ name: Website Monitor
 on:
   schedule:
     - cron: "0 * * * *"          # every 1 hour
-  workflow_dispatch:            # lets you run it manually from the Actions tab
-
-concurrency:
-  group: site-monitor
-  cancel-in-progress: true
+  workflow_dispatch:
 
 jobs:
   check:
+    name: check ${{ matrix.site }}
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false            # one site failing never stops the others
+      matrix:
+        site:
+          - scrapcarremovalqld
+          - 5starcashforcars
+          - instantcarremoval
+          - instantcarremovalsydney
+          - instantcarremovalqld
+          - icarpetcleanandpestcontrol
     steps:
       - uses: actions/checkout@v4
 
@@ -24,12 +31,13 @@ jobs:
       - name: Install dependencies
         run: pip install requests beautifulsoup4
 
-      - name: Check websites
+      - name: Check ${{ matrix.site }}
         env:
           SMTP_HOST: smtp.gmail.com
           SMTP_PORT: "465"
           SMTP_USER: ${{ secrets.SMTP_USER }}
           SMTP_PASS: ${{ secrets.SMTP_PASS }}
           MAIL_TO: ${{ secrets.MAIL_TO }}
-          SEND_OK_EMAIL: "true"       # email every run, even when all is fine
-        run: python check_sites.py
+          SEND_OK_EMAIL: "true"       # "false" = email only when something is broken
+          PER_SITE: "6"               # simultaneous requests to this site
+        run: python check_sites.py pages/${{ matrix.site }}.txt
