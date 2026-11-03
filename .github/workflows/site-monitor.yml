@@ -1,9 +1,13 @@
 name: Website Monitor
 
 on:
-  schedule:
-    - cron: "0 * * * *"          # every 1 hour
+  # No GitHub "schedule" here on purpose: an external cron job (cron-job.org) starts this
+  # workflow every hour through the GitHub API, so you never get duplicate emails.
   workflow_dispatch:
+
+concurrency:
+  group: site-monitor
+  cancel-in-progress: false
 
 jobs:
   check:
