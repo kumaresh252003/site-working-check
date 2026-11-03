@@ -123,21 +123,28 @@ def send_email(subject, body):
 
 
 def load_pages():
-    # usage: python check_sites.py pages/mysite.txt   (defaults to pages.txt)
-    path = sys.argv[1] if len(sys.argv) > 1 else os.path.join(
-        os.path.dirname(os.path.abspath(__file__)), "pages.txt")
+    # usage: python check_sites.py pages.txt [domain.com.au]
+    path = sys.argv[1] if len(sys.argv) > 1 else "pages.txt"
+    domain = sys.argv[2].lower() if len(sys.argv) > 2 else None
     with open(path, encoding="utf-8") as f:
         urls = [l.strip() for l in f if l.strip() and not l.strip().startswith("#")]
     seen, out = set(), []
     for u in urls:
-        if u.startswith("http") and u not in seen:
-            seen.add(u)
-            out.append(u)
-    return out
+        if not u.startswith("http") or u in seen:
+            continue
+        host = urlparse(u).netloc.lower()
+        if domain and host not in (domain, "www." + domain):
+            continue
+        seen.add(u)
+        out.append(u)
+    return out, domain
 
 
 def main():
-    urls = load_pages()
+    urls, domain = load_pages()
+    if not urls:
+        print(f"No URLs found for {domain or 'this list'} in the pages file - nothing to check.")
+        return
     sites = {}
     for u in urls:
         p = urlparse(u)
