@@ -29,7 +29,6 @@ MIN_VISIBLE_TEXT = 80      # fewer visible characters than this = "white screen"
 WORKERS = 30               # total pages checked in parallel
 PER_SITE = int(os.getenv("PER_SITE", "4"))               # max simultaneous requests to ONE website (prevents 503 overload/rate-limit)
 RETRY_STATUS = (429, 502, 503, 504)
-SLOW_SECONDS = 15
 MAX_LISTED_PER_SITE = 100  # keeps the email readable if a lot of pages fail
 
 ERROR_SIGNATURES = [
@@ -106,8 +105,6 @@ def _check_page(url):
     if len(text) < MIN_VISIBLE_TEXT:
         return {"url": url, "ok": False,
                 "problem": f"WHITE SCREEN - only {len(text)} characters of visible text"}
-    if secs > SLOW_SECONDS:
-        return {"url": url, "ok": False, "problem": f"Very slow ({secs:.1f}s)"}
     return {"url": url, "ok": True, "problem": ""}
 
 
