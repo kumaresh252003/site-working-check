@@ -184,6 +184,22 @@ def main():
         results = list(ex.map(check_page, todo))
     by_url = {r["url"]: r for r in results}
 
+    # 2b) Second chance: re-check server errors slowly after a pause.
+    # Separates real broken pages from temporary errors caused by server load.
+    flaky = set()
+    failed = [r["url"] for r in results if not r["ok"]
+              and (r["problem"].startswith("HTTP 5") or r["problem"].startswith("No response"))]
+    if failed and len(failed) <= 300:
+        print(f"Re-checking {len(failed)} failed pages after a short pause...")
+        time.sleep(20)
+        with ThreadPoolExecutor(max_workers=3) as ex:
+            for r in ex.map(check_page, failed):
+                if r["ok"]:
+                    flaky.add(r["url"])
+                else:
+                    r["problem"] += " (failed again on re-check)"
+                by_url[r["url"]] = r
+
     # 3) Build report
     report, problems = [], 0
     for site, pages in sites.items():
@@ -196,6 +212,9 @@ def main():
         problems += len(bad)
         print(f"[{'ISSUES' if bad else 'OK'}] {site}: {len(pages)} pages, {len(bad)} problems")
         report.append(f"{site}\n  Pages checked: {len(pages)}  |  Problems: {len(bad)}")
+        recovered = sum(1 for u in pages if u in flaky)
+        if recovered:
+            report.append(f"  ({recovered} page(s) gave a temporary server error but worked on re-check)")
         for r in bad[:MAX_LISTED_PER_SITE]:
             print(f"    - {r['url']} -> {r['problem']}")
             report.append(f"    X {r['url']}\n      {r['problem']}")
