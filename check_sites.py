@@ -5,6 +5,7 @@ Detects: HTTP errors, timeouts, white/blank pages, PHP/WordPress error pages.
 Emails a report. Fast: pages are checked in parallel.
 """
 import os
+import json
 import re
 import smtplib
 import threading
@@ -140,10 +141,21 @@ def load_pages():
     return out, domain
 
 
+def save_report(site, pages, problems, details):
+    """When REPORT_DIR is set, save results for the combined email instead of emailing."""
+    out = os.environ["REPORT_DIR"]
+    os.makedirs(out, exist_ok=True)
+    name = (site or "all").replace("/", "_")
+    with open(os.path.join(out, name + ".json"), "w", encoding="utf-8") as f:
+        json.dump({"site": site, "pages": pages, "problems": problems, "details": details}, f)
+
+
 def main():
     urls, domain = load_pages()
     if not urls:
         print(f"No URLs found for {domain or 'this list'} in the pages file - nothing to check.")
+        if os.getenv("REPORT_DIR"):
+            save_report(domain, 0, 0, f"{domain}\n  No pages listed in pages.txt - nothing checked\n")
         return
     sites = {}
     for u in urls:
@@ -195,6 +207,11 @@ def main():
     took = int(time.time() - started)
     body = (f"Website check at {now} (took {took}s)\n"
             f"Total pages: {len(urls)}\nTotal problems: {problems}\n\n" + "\n".join(report))
+
+    if os.getenv("REPORT_DIR"):
+        save_report(domain, len(urls), problems, "\n".join(report))
+        print("Report saved for the combined email.")
+        sys.exit(1 if problems else 0)
 
     if problems:
         send_email(f"ALERT: {problems} problem(s) on {names}", body)
