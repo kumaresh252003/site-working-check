@@ -14,12 +14,12 @@ jobs:
       fail-fast: false            # one site failing never stops the others
       matrix:
         site:
-          - scrapcarremovalqld
-          - 5starcashforcars
-          - instantcarremoval
-          - instantcarremovalsydney
-          - instantcarremovalqld
-          - icarpetcleanandpestcontrol
+          - scrapcarremovalqld.com.au
+          - 5starcashforcars.com.au
+          - instantcarremoval.com.au
+          - instantcarremovalsydney.com.au
+          - instantcarremovalqld.com.au
+          - icarpetcleanandpestcontrol.com.au
     steps:
       - uses: actions/checkout@v4
 
@@ -40,4 +40,4 @@ jobs:
           MAIL_TO: ${{ secrets.MAIL_TO }}
           SEND_OK_EMAIL: "true"       # "false" = email only when something is broken
           PER_SITE: "6"               # simultaneous requests to this site
-        run: python check_sites.py pages/${{ matrix.site }}.txt
+        run: python check_sites.py pages.txt ${{ matrix.site }}
