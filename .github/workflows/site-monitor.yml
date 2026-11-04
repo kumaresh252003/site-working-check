@@ -85,10 +85,8 @@ jobs:
           TRANSIENT_PAUSE: "30"       # pause before re-checking pages that answered 5xx
           SLOW_HOSTS: "capitalautocarremovals.com.au"   # hosts that need longer than 20 s to answer
           SLOW_TIMEOUT: "90"          # seconds allowed for those hosts (it often needs ~60 s)
-          CONTACT_FORM_CHECK: "true"  # record, for every page, whether a contact form exists
-          CONTACT_FORM_SHOT: "true"   # take one picture of each site's contact form for the email
-          SHOT_QUALITY: "70"          # jpeg quality of those pictures (keeps the mail small)
-          CONTACT_FORM_REQUIRED: "false"  # "true" = a page without a contact form counts as a problem
+          CONTACT_FORM_CHECK: "true"  # look for a contact form on each site's HOMEPAGE
+          CONTACT_FORM_REQUIRED: "false"  # "true" = a homepage without a form counts as a problem
         run: python check_sites.py pages.txt ${{ matrix.site }}
 
       - name: Save report
