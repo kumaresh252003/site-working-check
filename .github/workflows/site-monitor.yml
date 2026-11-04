@@ -86,8 +86,6 @@ jobs:
           EXTERNAL_READER: "true"     # when a host refuses our IP, confirm with an outside reader
           SLOW_HOSTS: "capitalautocarremovals.com.au"   # hosts that need longer than 20 s to answer
           SLOW_TIMEOUT: "90"          # seconds allowed for those hosts (it often needs ~60 s)
-          CONTACT_FORM_CHECK: "true"  # look for a contact form on each site's HOMEPAGE
-          CONTACT_FORM_REQUIRED: "false"  # "true" = a homepage without a form counts as a problem
         run: python check_sites.py pages.txt ${{ matrix.site }}
 
       - name: Save report
