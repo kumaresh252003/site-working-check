@@ -28,7 +28,6 @@ import sys
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
-from email.mime.image import MIMEImage
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.utils import formatdate, make_msgid
@@ -113,78 +112,28 @@ def render_html(ctx):
             "No errors. Every page returned content.</div>"
         )
 
-    # contact-form audit (only when the checks reported it)
-    form_sites = [x for x in ctx["sites"] if "with_form" in x]
+    # contact form on the homepage (only when the checks reported it)
+    form_sites = [x for x in ctx["sites"] if x.get("home_form") is not None]
     forms_html = ""
     if form_sites:
-        total_pages = sum(x.get("pages", 0) for x in form_sites)
-        total_have = sum(x.get("with_form", 0) for x in form_sites)
-        total_missing = sum(x.get("no_form_count", 0) for x in form_sites)
-        missing_note = f" &mdash; {total_missing} page(s) do not" if total_missing else ""
-        shots = [x for x in form_sites if x.get("form_image")]
+        have = [x for x in form_sites if x.get("home_form")]
+        missing = [x for x in form_sites if not x.get("home_form")]
         form_rows = [f'<div style="font-size:13px;color:#000;">'
-                f'{total_have} of {total_pages} pages have a contact form'
-                f'{missing_note}</div>']
-        for x in form_sites:
-            listed = x.get("no_form") or []
-            missing = x.get("no_form_count", 0)
-            if not missing:
-                continue
+                f'{len(have)} of {len(form_sites)} homepages have a contact form</div>']
+        for x in missing:
             form_rows.append(
-                f'<div style="margin:12px 0 4px;font-size:13px;color:#000;">'
-                f'{esc(x.get("site", ""))} &mdash; {missing} page(s) without a form</div>'
+                f'<div style="margin:8px 0 0;font-size:13px;color:#000;">'
+                f'{esc(x.get("site", ""))} &mdash; no contact form on the homepage</div>'
+                f'<div style="margin:2px 0 0 14px;font-size:12px;color:#555;'
+                f'word-break:break-all;">{esc(x.get("home_url", ""))}</div>'
             )
-            for url in listed:
-                form_rows.append(
-                    f'<div style="margin:0 0 4px 14px;font-size:12px;color:#555;'
-                    f'word-break:break-all;">{esc(url)}</div>'
-                )
-            if missing > len(listed):
-                form_rows.append(
-                    f'<div style="margin:0 0 4px 14px;font-size:12px;color:#777;">'
-                    f'&hellip; and {missing - len(listed)} more</div>'
-                )
-        # two pictures per row keeps the mail readable instead of 15 stacked photos
-        cells = []
-        for x in shots:
-            label = esc(x.get("site", ""))
-            have = x.get("with_form", 0)
-            total = x.get("pages", 0)
-            state = (f"{have} of {total} pages have a form" if have
-                     else f"no form found on any of the {total} pages")
-            caption = esc(x.get("form_image_page", ""))
-            cells.append(
-                '<td width="50%" valign="top" style="padding:0 8px 18px 0;">'
-                f'<div style="font-size:12px;font-weight:700;color:#000;word-break:break-all;">'
-                f'{label}</div>'
-                f'<div style="font-size:11px;color:#555;margin:1px 0 6px;">{state}</div>'
-                f'<img src="cid:{esc(x["form_image"])}" alt="Contact form on {label}" '
-                'style="display:block;width:100%;max-width:260px;height:auto;'
-                'border:1px solid #e5e5e5;">'
-                f'<div style="font-size:10px;color:#777;margin-top:4px;word-break:break-all;">'
-                f'{caption}</div>'
-                "</td>"
-            )
-        picture_rows = []
-        for i in range(0, len(cells), 2):
-            pair = cells[i:i + 2]
-            if len(pair) == 1:
-                pair.append('<td width="50%" style="padding:0;"></td>')
-            picture_rows.append("<tr>" + "".join(pair) + "</tr>")
-        pictures_html = (
-            '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" '
-            'style="width:100%;border-collapse:collapse;">'
-            + "".join(picture_rows) + "</table>"
-        )
-
         forms_html = (
             '<div style="margin-top:26px;">'
             '<div style="font-size:12px;font-weight:700;letter-spacing:1.4px;'
             'text-transform:uppercase;color:#000;padding-bottom:8px;'
-            'border-bottom:1px solid #000;">Contact forms</div>'
+            'border-bottom:1px solid #000;">Contact form on homepage</div>'
             f'<div style="padding-top:14px;">{"".join(form_rows)}</div>'
-            + (f'<div style="margin-top:22px;">{pictures_html}</div>' if picture_rows else "")
-            + "</div>"
+            "</div>"
         )
 
     return f"""<!DOCTYPE html>
@@ -263,27 +212,15 @@ def render_text(ctx):
             lines.append(f"    {shorten(what, 300)}")
     else:
         lines.append("No errors. Every page returned content.")
-    form_sites = [x for x in ctx["sites"] if "with_form" in x]
+    form_sites = [x for x in ctx["sites"] if x.get("home_form") is not None]
     if form_sites:
-        total_pages = sum(x.get("pages", 0) for x in form_sites)
-        total_have = sum(x.get("with_form", 0) for x in form_sites)
-        total_missing = sum(x.get("no_form_count", 0) for x in form_sites)
-        lines += ["", "CONTACT FORMS",
-                  f"  {total_have} of {total_pages} pages have a contact form"
-                  + (f" - {total_missing} page(s) do not" if total_missing else "")]
-        for x in form_sites:
-            missing = x.get("no_form_count", 0)
-            listed = x.get("no_form") or []
-            if not missing:
-                continue
-            lines.append(f"  {x.get('site','')} - {missing} page(s) without a form")
-            for url in listed:
-                lines.append(f"    - {url}")
-            if missing > len(listed):
-                lines.append(f"    ... and {missing - len(listed)} more")
-        shots = [x for x in form_sites if x.get("form_image")]
-        if shots:
-            lines.append(f"  {len(shots)} contact form picture(s) attached with the HTML version")
+        have = [x for x in form_sites if x.get("home_form")]
+        missing = [x for x in form_sites if not x.get("home_form")]
+        lines += ["", "CONTACT FORM ON HOMEPAGE",
+                  f"  {len(have)} of {len(form_sites)} homepages have a contact form"]
+        for x in missing:
+            lines.append(f"  {x.get('site','')} - no contact form on the homepage "
+                         f"({x.get('home_url','')})")
     lines += ["", "-- ", "site-working-check" + (f" | {ctx['run_url']}" if ctx.get("run_url") else "")]
     return "\n".join(lines)
 
@@ -328,12 +265,8 @@ def build_context(reports, expected):
                     "down": s.get("down", False),
                     "items": s.get("items") or [],
                     "notes": s.get("notes") or [],
-                    "with_form": s.get("with_form", 0),
-                    "no_form_count": s.get("no_form_count", 0),
-                    "no_form": s.get("no_form") or [],
-                    "form_image": s.get("form_image", ""),
-                    "form_image_page": s.get("form_image_page", ""),
-                    "form_image_found": s.get("form_image_found"),
+                    "home_form": s.get("home_form"),
+                    "home_url": s.get("home_url", ""),
                 })
         else:                       # older report format
             p = r.get("problems", 0)
@@ -406,7 +339,7 @@ def write_step_summary(markdown):
             pass
 
 
-def send_email(subject, text_body, html_body=None, images=None):
+def send_email(subject, text_body, html_body=None):
     host = os.getenv("SMTP_HOST", "smtp.gmail.com")
     port = int(os.getenv("SMTP_PORT", "465"))
     user, pwd = os.environ["SMTP_USER"], os.environ["SMTP_PASS"]
@@ -414,22 +347,7 @@ def send_email(subject, text_body, html_body=None, images=None):
     if not to:
         raise ValueError("MAIL_TO is empty - nothing to send to")
 
-    images = images or []
-    if html_body and images:
-        # multipart/related keeps the pictures inside the mail, so Gmail shows them
-        # straight away instead of blocking them like remote images.
-        msg = MIMEMultipart("related")
-        alt = MIMEMultipart("alternative")
-        alt.attach(MIMEText(text_body, "plain", "utf-8"))
-        alt.attach(MIMEText(html_body, "html", "utf-8"))
-        msg.attach(alt)
-        for cid, data in images:
-            subtype = "png" if str(cid).lower().endswith(".png") else "jpeg"
-            img = MIMEImage(data, _subtype=subtype)
-            img.add_header("Content-ID", f"<{cid}>")
-            img.add_header("Content-Disposition", "inline", filename=str(cid))
-            msg.attach(img)
-    elif html_body:
+    if html_body:
         msg = MIMEMultipart("alternative")
         msg.attach(MIMEText(text_body, "plain", "utf-8"))
         msg.attach(MIMEText(html_body, "html", "utf-8"))
@@ -584,30 +502,9 @@ def main():
     use_html = os.getenv("EMAIL_FORMAT", "html").lower() != "text"
     html_body = render_html(ctx) if use_html else None
 
-    # contact-form screenshots taken by check_sites.py (one per website)
-    images, skipped = [], 0
-    if use_html and os.getenv("CONTACT_FORM_SHOT", "true").lower() != "false":
-        budget = 10 * 1024 * 1024
-        for site in ctx["sites"]:
-            name = site.get("form_image")
-            if not name:
-                continue
-            path = os.path.join("reports", os.path.basename(name))
-            if not os.path.isfile(path):
-                skipped += 1
-                continue
-            data = open(path, "rb").read()
-            if budget - len(data) < 0:
-                skipped += 1
-                continue
-            budget -= len(data)
-            images.append((os.path.basename(name), data))
-        print(f"Contact form pictures attached: {len(images)}"
-              + (f" ({skipped} missing)" if skipped else ""))
-
     recipient = os.getenv("MAIL_TO", "(MAIL_TO not set)")
     try:
-        send_email(ctx["subject"], text_body, html_body, images)
+        send_email(ctx["subject"], text_body, html_body)
         print(f"Email sent: {ctx['subject']}")
         print(f"  from {os.getenv('SMTP_USER', '?')} to {recipient}")
         write_step_summary(f"## Email: sent\n**{esc(ctx['subject'])}**\n\n"
