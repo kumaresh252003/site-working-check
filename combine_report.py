@@ -63,40 +63,31 @@ def status_mark(site):
     return "❌" if (site.get("problems") or site.get("down")) else "✅"
 
 
-def error_lines(ctx):
-    """Plain-text style list of everything that went wrong, site by site (no repeats)."""
-    lines, seen = [], set()
-
-    def add(where, what):
-        key = (where, what)
-        if key in seen:              # the same line twice in one email helps nobody
-            return
-        seen.add(key)
-        lines.append(key)
-
+def error_groups(ctx):
+    """[(site, [(where, what), ...]), ...] - the errors of one website together."""
+    groups = []
     for s in ctx["sites"]:
         name = s.get("site") or ""
         notes = list(s.get("notes") or [])
+        entries, seen = [], set()
         if s.get("down"):
-            add(name, notes[0] if notes else "Site unreachable")
+            line = notes[0] if notes else "Site unreachable"
+            entries.append((name, line))
+            seen.add((name, line))
         for item in s.get("items") or []:
-            add(item.get("url", ""), item.get("problem", ""))
-    return lines
+            key = (item.get("url", ""), item.get("problem", ""))
+            if key in seen:
+                continue
+            seen.add(key)
+            entries.append(key)
+        if entries:
+            groups.append((name, entries))
+    return groups
 
 
-def note_lines(ctx):
-    """Extra information about a site that is not a problem (kept out of ERRORS)."""
-    lines, seen = [], set()
-    for s in ctx["sites"]:
-        name = s.get("site") or ""
-        notes = list(s.get("notes") or [])
-        if s.get("down") and notes:
-            notes = notes[1:]        # the first note is already the "unreachable" line
-        for note in notes:
-            if (name, note) not in seen:
-                seen.add((name, note))
-                lines.append((name, note))
-    return lines
+def error_lines(ctx):
+    """Flat version of the same list (kept for the plain-text summary)."""
+    return [entry for _, entries in error_groups(ctx) for entry in entries]
 
 
 def render_html(ctx):
@@ -110,72 +101,44 @@ def render_html(ctx):
         for s in ctx["sites"]
     )
 
-    errors = error_lines(ctx)
-    if errors:
-        blocks = "".join(
-            f'<div style="margin:0 0 14px;">'
-            f'<div style="font-size:13px;color:#000;word-break:break-all;">{esc(where)}</div>'
-            f'<div style="font-size:13px;line-height:1.6;color:#555;word-break:break-word;">'
-            f'{esc(shorten(what, 300))}</div>'
-            f"</div>"
-            for where, what in errors
-        )
+    groups = error_groups(ctx)
+    if groups:
+        blocks = []
+        for site_name, entries in groups:
+            entries_html = []
+            for where, what in entries:
+                if where and where != site_name:
+                    entries_html.append(
+                        f'<div style="margin:0 0 3px;font-size:12px;color:#000;'
+                        f'word-break:break-all;">{esc(where)}</div>'
+                        f'<div style="margin:0 0 10px;font-size:12px;line-height:1.55;'
+                        f'color:#555;word-break:break-word;">{esc(shorten(what, 300))}</div>'
+                    )
+                else:
+                    entries_html.append(
+                        f'<div style="margin:0 0 10px;font-size:12px;line-height:1.55;'
+                        f'color:#555;word-break:break-word;">{esc(shorten(what, 300))}</div>'
+                    )
+            blocks.append(
+                '<div style="margin:0 0 20px;">'
+                f'<div style="font-size:13px;font-weight:700;color:#000;'
+                f'padding-bottom:6px;margin-bottom:8px;border-bottom:1px solid #e5e5e5;'
+                f'word-break:break-all;">{esc(site_name)}</div>'
+                + "".join(entries_html) +
+                "</div>"
+            )
         errors_html = (
-            f'<div style="margin-top:26px;">'
-            f'<div style="font-size:12px;font-weight:700;letter-spacing:1.4px;'
-            f'text-transform:uppercase;color:#000;padding-bottom:8px;'
-            f'border-bottom:1px solid #000;">Errors</div>'
-            f'<div style="padding-top:14px;">{blocks}</div>'
-            f"</div>"
+            '<div style="margin-top:26px;">'
+            '<div style="font-size:12px;font-weight:700;letter-spacing:1.4px;'
+            'text-transform:uppercase;color:#000;padding-bottom:8px;'
+            'border-bottom:1px solid #000;">Errors</div>'
+            f'<div style="padding-top:16px;">{"".join(blocks)}</div>'
+            "</div>"
         )
     else:
         errors_html = (
             '<div style="margin-top:26px;font-size:13px;color:#555;">'
             "No errors. Every page returned content.</div>"
-        )
-
-    notes = note_lines(ctx)
-    if notes:
-        note_blocks = "".join(
-            f'<div style="margin:0 0 12px;">'
-            f'<div style="font-size:12px;color:#000;">{esc(where)}</div>'
-            f'<div style="font-size:12px;line-height:1.6;color:#555;">{esc(what)}</div>'
-            f"</div>"
-            for where, what in notes
-        )
-        notes_html = (
-            '<div style="margin-top:26px;">'
-            '<div style="font-size:12px;font-weight:700;letter-spacing:1.4px;'
-            'text-transform:uppercase;color:#000;padding-bottom:8px;'
-            'border-bottom:1px solid #000;">Notes</div>'
-            f'<div style="padding-top:14px;">{note_blocks}</div>'
-            "</div>"
-        )
-    else:
-        notes_html = ""
-
-    # contact form on the homepage (only when the checks reported it)
-    form_sites = [x for x in ctx["sites"] if x.get("home_form") is not None]
-    forms_html = ""
-    if form_sites:
-        have = [x for x in form_sites if x.get("home_form")]
-        missing = [x for x in form_sites if not x.get("home_form")]
-        form_rows = [f'<div style="font-size:13px;color:#000;">'
-                f'{len(have)} of {len(form_sites)} homepages have a contact form</div>']
-        for x in missing:
-            form_rows.append(
-                f'<div style="margin:8px 0 0;font-size:13px;color:#000;">'
-                f'{esc(x.get("site", ""))} &mdash; no contact form on the homepage</div>'
-                f'<div style="margin:2px 0 0 14px;font-size:12px;color:#555;'
-                f'word-break:break-all;">{esc(x.get("home_url", ""))}</div>'
-            )
-        forms_html = (
-            '<div style="margin-top:26px;">'
-            '<div style="font-size:12px;font-weight:700;letter-spacing:1.4px;'
-            'text-transform:uppercase;color:#000;padding-bottom:8px;'
-            'border-bottom:1px solid #000;">Contact form on homepage</div>'
-            f'<div style="padding-top:14px;">{"".join(form_rows)}</div>'
-            "</div>"
         )
 
     return f"""<!DOCTYPE html>
@@ -219,8 +182,6 @@ def render_html(ctx):
    </td></tr>
 
    <tr><td>{errors_html}</td></tr>
-   <tr><td>{notes_html}</td></tr>
-   <tr><td>{forms_html}</td></tr>
 
    <tr><td style="padding-top:26px;">
      <div style="border-top:1px solid #e5e5e5;padding-top:12px;font-size:11px;
@@ -247,29 +208,17 @@ def render_text(ctx):
         mark = status_mark(s)
         lines.append(f"{name:<40} {mark}")
     lines.append("")
-    errors = error_lines(ctx)
-    if errors:
+    groups = error_groups(ctx)
+    if groups:
         lines.append("ERRORS")
-        for where, what in errors:
-            lines.append(f"  {where}")
-            lines.append(f"    {shorten(what, 300)}")
+        for site_name, entries in groups:
+            lines.append(f"  {site_name}")
+            for where, what in entries:
+                if where and where != site_name:
+                    lines.append(f"    {where}")
+                lines.append(f"      {shorten(what, 300)}")
     else:
         lines.append("No errors. Every page returned content.")
-    form_sites = [x for x in ctx["sites"] if x.get("home_form") is not None]
-    if form_sites:
-        have = [x for x in form_sites if x.get("home_form")]
-        missing = [x for x in form_sites if not x.get("home_form")]
-        lines += ["", "CONTACT FORM ON HOMEPAGE",
-                  f"  {len(have)} of {len(form_sites)} homepages have a contact form"]
-        for x in missing:
-            lines.append(f"  {x.get('site','')} - no contact form on the homepage "
-                         f"({x.get('home_url','')})")
-    notes = note_lines(ctx)
-    if notes:
-        lines += ["", "NOTES"]
-        for where, what in notes:
-            lines += [f"  {where}", f"    {what}"]
-
     lines += ["", "-- ", "site-working-check" + (f" | {ctx['run_url']}" if ctx.get("run_url") else "")]
     return "\n".join(lines)
 
@@ -314,8 +263,6 @@ def build_context(reports, expected):
                     "down": s.get("down", False),
                     "items": s.get("items") or [],
                     "notes": s.get("notes") or [],
-                    "home_form": s.get("home_form"),
-                    "home_url": s.get("home_url", ""),
                 })
         else:                       # older report format
             p = r.get("problems", 0)
