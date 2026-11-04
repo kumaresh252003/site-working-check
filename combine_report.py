@@ -281,6 +281,17 @@ def build_context(reports, expected):
 # ---------------------------------------------------------------------------
 # sending
 # ---------------------------------------------------------------------------
+def mask(address):
+    """kumaresh252003@gmail.com -> kum********3@gmail.com (visible in a public repo)."""
+    address = (address or "").strip()
+    if "@" not in address:
+        return address or "(empty)"
+    local, _, domain = address.partition("@")
+    if len(local) <= 6:
+        return f"{local[:2]}***@{domain}"
+    return f"{local[:3]}***{local[-3:]}@{domain}"
+
+
 def write_step_summary(markdown):
     """Write to the GitHub job summary: visible on the run page, no log digging."""
     path = os.getenv("GITHUB_STEP_SUMMARY")
@@ -308,11 +319,11 @@ def send_email(subject, text_body, html_body=None):
         msg = MIMEText(text_body, "plain", "utf-8")
 
     msg["Subject"] = subject
-    msg["From"] = f"Website Monitor <{user}>"
+    msg["From"] = user                     # plain address: looks like a normal mail, not bulk
     msg["To"] = ", ".join(to)
     msg["Date"] = formatdate(localtime=False)
     msg["Message-ID"] = make_msgid(domain=(user.split("@")[-1] or "localhost"))
-    msg["X-Entity-Ref-ID"] = datetime.now(timezone.utc).strftime("%Y%m%d%H")
+    msg["Auto-Submitted"] = "auto-generated"
 
     with smtplib.SMTP_SSL(host, port, context=ssl.create_default_context()) as s:
         s.login(user, pwd)
@@ -404,8 +415,13 @@ def main():
             send_email(ctx["subject"],
                        "Test email from Website Monitor.\n\nIf you received this, SMTP_USER, "
                        "SMTP_PASS and MAIL_TO are correct and the hourly reports will arrive too.",
-                       render_html(ctx))
+                       render_html(ctx) if os.getenv("EMAIL_FORMAT", "html").lower() != "text"
+                       else None)
             print(f"Test email sent from {os.getenv('SMTP_USER', '?')} to {to}")
+            write_step_summary(f"## Test email: sent\nTo `{mask(os.getenv('MAIL_TO', ''))}` via "
+                               f"{os.getenv('SMTP_HOST', 'smtp.gmail.com')}.\n\n"
+                               "If it is not in your inbox, look in **Spam** - and check that "
+                               "the `MAIL_TO` secret is exactly the address you are reading.")
         except KeyError as e:
             print(f"Test FAILED: environment variable {e} is missing in this job.")
             print("Add it under Settings -> Secrets and variables -> Actions.")
@@ -447,16 +463,19 @@ def main():
         print(f"Dedupe check: {reason}.")
 
     text_body = render_text(ctx)
-    html_body = render_html(ctx)
+    use_html = os.getenv("EMAIL_FORMAT", "html").lower() != "text"
+    html_body = render_html(ctx) if use_html else None
 
     recipient = os.getenv("MAIL_TO", "(MAIL_TO not set)")
     try:
         send_email(ctx["subject"], text_body, html_body)
         print(f"Email sent: {ctx['subject']}")
         print(f"  from {os.getenv('SMTP_USER', '?')} to {recipient}")
-        write_step_summary(f"## Email: sent\n**{esc(ctx['subject'])}**\n\nFrom "
-                           f"`{os.getenv('SMTP_USER', '?')}` to `{recipient}` via "
-                           f"{os.getenv('SMTP_HOST', 'smtp.gmail.com')}.")
+        write_step_summary(f"## Email: sent\n**{esc(ctx['subject'])}**\n\n"
+                           f"Sent to `{mask(os.getenv('MAIL_TO', ''))}` via "
+                           f"{os.getenv('SMTP_HOST', 'smtp.gmail.com')}.\n\n"
+                           "If you cannot find it: check **Spam**, and check the `MAIL_TO` "
+                           "secret above is exactly your address.")
     except KeyError as e:
         print(f"Email not sent: missing environment variable {e} "
               f"(set SMTP_USER, SMTP_PASS and MAIL_TO).")
