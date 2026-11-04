@@ -700,13 +700,19 @@ def load_pages():
     return out, domain
 
 
-def save_report(site, pages, problems, details):
-    """When REPORT_DIR is set, save results for the combined email instead of emailing."""
+def save_report(site, pages, problems, details, sites_payload=None):
+    """When REPORT_DIR is set, save results for the combined email instead of emailing.
+
+    `sites_payload` is the structured version of the same information (per site: the
+    failing pages with their reason, plus notes). The combined HTML email uses it to
+    render the report; `details` stays as the plain-text fallback.
+    """
     out = os.environ["REPORT_DIR"]
     os.makedirs(out, exist_ok=True)
     name = (site or "all").replace("/", "_")
     with open(os.path.join(out, name + ".json"), "w", encoding="utf-8") as f:
-        json.dump({"site": site, "pages": pages, "problems": problems, "details": details}, f)
+        json.dump({"site": site, "pages": pages, "problems": problems,
+                   "details": details, "sites": sites_payload or []}, f)
 
 
 # ---------------------------------------------------------------------------
@@ -857,9 +863,15 @@ def main():
 
     # 4) Build the report
     report, problems = [], 0
+    sites_payload = []            # structured copy for the HTML email
     for site, pages in sites.items():
+        entry = {"site": urlparse(site).netloc, "url": site, "pages": len(pages),
+                 "problems": 0, "items": [], "notes": [], "down": False}
+        sites_payload.append(entry)
         if site in down:
             problems += 1
+            entry.update(problems=1, down=True)
+            entry["notes"].append(f"Site unreachable - {down[site]}. {len(pages)} pages not checked.")
             print(f"[SITE DOWN] {site}: {down[site]}")
             report.append(f"{site}\n  SITE DOWN - cannot be reached ({down[site]})\n  {len(pages)} pages not checked\n")
             continue
@@ -874,20 +886,27 @@ def main():
             bad = []
 
         problems += (1 if cluster else len(bad))
+        entry["problems"] = 1 if cluster else len(bad)
         print(f"[{'ISSUES' if (bad or cluster) else 'OK'}] {site}: {len(pages)} pages, "
               f"{(1 if cluster else len(bad))} problems")
         report.append(f"{site}\n  Pages checked: {len(pages)}  |  Problems: {1 if cluster else len(bad)}")
 
         recovered = sum(1 for u in pages if u in flaky)
         if recovered:
+            entry["notes"].append(f"{recovered} page(s) gave a temporary server error but worked on re-check.")
             report.append(f"  ({recovered} page(s) gave a temporary server error but worked on re-check)")
 
         js_rendered = sum(1 for u in pages if by_url[u].get("js_rendered"))
         if js_rendered:
+            entry["notes"].append(f"{js_rendered} page(s) are rendered by JavaScript - confirmed OK in a browser.")
             report.append(f"  ({js_rendered} page(s) are rendered by JavaScript - confirmed OK in a browser)")
 
         if cluster:
             sample, count = cluster["sample"], cluster["count"]
+            entry["notes"].append(
+                f"PROTECTED, NOT BROKEN - the same {cluster['length']}-character page was "
+                f"returned for {count} of {len(pages)} URLs: \"{sample[:160]}\". This is a "
+                f"firewall / rate-limit notice, not missing content.")
             print(f"  ! {count} of {len(pages)} pages returned the same short page "
                   f"- reporting that once instead of {count} times.")
             report.append(
@@ -907,6 +926,7 @@ def main():
 
         for r in bad[:MAX_LISTED_PER_SITE]:
             print(f"    - {r['url']} -> {r['problem']}")
+            entry["items"].append({"url": r["url"], "problem": r["problem"]})
             report.append(f"    X {r['url']}\n      {r['problem']}")
         if len(bad) > MAX_LISTED_PER_SITE:
             report.append(f"    ... and {len(bad) - MAX_LISTED_PER_SITE} more (see GitHub Actions log)")
@@ -918,7 +938,7 @@ def main():
             f"Total pages: {len(urls)}\nTotal problems: {problems}\n\n" + "\n".join(report))
 
     if os.getenv("REPORT_DIR"):
-        save_report(domain, len(urls), problems, "\n".join(report))
+        save_report(domain, len(urls), problems, "\n".join(report), sites_payload)
         print("Report saved for the combined email.")
         sys.exit(1 if problems else 0)
 
