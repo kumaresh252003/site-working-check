@@ -107,6 +107,8 @@ CONTACT_FORM_REQUIRED = os.getenv("CONTACT_FORM_REQUIRED", "false").lower() == "
 
 SETTLE_SECONDS = 3.0       # how long to watch the page until the text stops growing
 NAV_TIMEOUT = 45
+EXTERNAL_TIMEOUT = 60      # seconds for the third-party reader used when our IP is refused
+EXTERNAL_READER = os.getenv("EXTERNAL_READER", "true").lower() != "false"
 
 # A page whose raw HTML contains one of these is broken, not just empty.
 ERROR_SIGNATURES = [
@@ -445,6 +447,27 @@ def fetch(url, retries=RETRIES):
             last_err = f"{type(e).__name__}: {str(e)[:120]}"
             time.sleep(2)
     return None, last_err, 0
+
+
+def external_render(url):
+    """What does the page say, according to a public reader service?
+
+    Used only when our own IP is refused by the host: some servers drop connections
+    from datacenter ranges (scrapmycarcanberra.com.au does exactly that) while the
+    site is perfectly fine for real visitors. The reader fetches the page from a
+    different network, so an empty answer is a real outage and text means "up".
+    """
+    try:
+        r = session.get("https://r.jina.ai/" + url, timeout=EXTERNAL_TIMEOUT)
+        if r.status_code != 200:
+            return "", f"reader HTTP {r.status_code}"
+        body = r.text or ""
+        if "Markdown Content:" in body:
+            body = body.split("Markdown Content:", 1)[1]
+        body = re.sub(r"\s+", " ", body).strip()
+        return body, ""
+    except Exception as e:
+        return "", f"{type(e).__name__}: {str(e)[:80]}"
 
 
 def check_page(url):
@@ -951,8 +974,38 @@ def main():
             if err:
                 down[site] = err
 
+    # A refused connection is not proof that a website is down. Before saying so,
+    # ask a real browser, then an outside reader: if either sees the page, the site
+    # is up and only OUR ip is being blocked.
+    refused_only = {}
+    for site in list(down):
+        err = down[site]
+        if not any(k in err for k in ("ConnectionError", "RemoteDisconnected",
+                                      "Connection aborted", "SSLError", "ConnectionReset")):
+            continue
+        proof = ""
+        if USE_BROWSER:
+            try:
+                p = browser_probe(site + "/")
+                if p and not p.get("error") and int(p.get("chars") or 0) >= MIN_VISIBLE_TEXT:
+                    proof = "a real browser"
+            except Exception:
+                pass
+        if not proof and EXTERNAL_READER:
+            body, why = external_render(site + "/")
+            if len(body) >= MIN_VISIBLE_TEXT:
+                proof = "an outside reader"
+            else:
+                print(f"  {site}: reader also failed ({why}) - keeping it as DOWN")
+        if proof:
+            refused_only[site] = proof
+            down.pop(site)
+            print(f"  {site}: our connection was refused, but the site answered {proof} "
+                  f"- not reporting it as down")
+
     # 2) Check all pages of the reachable sites in one big parallel pool (HTTP only)
-    lists = [pages for site, pages in sites.items() if site not in down]
+    skip_sites = set(down) | set(refused_only)   # nothing to fetch for these
+    lists = [pages for site, pages in sites.items() if site not in skip_sites]
     todo = [u for group in zip_longest(*lists) for u in group if u]   # interleave sites
     with ThreadPoolExecutor(max_workers=WORKERS) as ex:
         results = list(ex.map(check_page, todo))
@@ -1025,6 +1078,16 @@ def main():
         entry = {"site": urlparse(site).netloc, "url": site, "pages": len(pages),
                  "problems": 0, "items": [], "notes": [], "down": False}
         sites_payload.append(entry)
+        if site in refused_only:
+            entry["home_form"] = None          # pages were not checked, so no form verdict
+            entry["home_url"] = site + "/"
+            entry["notes"].append(
+                f"Note: the host refused our checker's connection, but the website answered "
+                f"{refused_only[site]} - it is up. Its pages could not be checked one by one "
+                f"this hour.")
+            report.append(f"{site}\n  UP - the host refused our connection, but the site "
+                          f"answered {refused_only[site]}\n  (pages not checked one by one)\n")
+            continue
         if site in down:
             problems += 1
             entry.update(problems=1, down=True)
