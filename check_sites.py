@@ -67,6 +67,23 @@ from requests.adapters import HTTPAdapter
 
 # ----------------------------- settings ------------------------------------
 TIMEOUT = 20               # seconds per request
+# Some hosts are just slow (capitalautocarremovals.com.au needs ~60 s for the first byte).
+# They get a longer timeout instead of a false "unreachable" alert every hour.
+SLOW_TIMEOUT = int(os.getenv("SLOW_TIMEOUT", "90"))
+SLOW_BROWSER_TIMEOUT = int(os.getenv("SLOW_BROWSER_TIMEOUT", "120000"))  # ms
+SLOW_HOSTS = {
+    h.strip().lower().removeprefix("www.")
+    for h in os.getenv("SLOW_HOSTS", "capitalautocarremovals.com.au").split(",")
+    if h.strip()
+}
+
+
+def is_slow(url):
+    return urlparse(url).netloc.lower().removeprefix("www.") in SLOW_HOSTS
+
+
+def timeout_for(url):
+    return SLOW_TIMEOUT if is_slow(url) else TIMEOUT
 RETRIES = 2                # extra attempts before marking a page failed
 MIN_VISIBLE_TEXT = 80      # fewer visible characters than this = suspicious
 WORKERS = 30               # total pages checked in parallel
@@ -82,6 +99,16 @@ BROWSER_PAUSE = float(os.getenv("BROWSER_PAUSE", "0.4"))   # seconds between bro
 MAX_TRANSIENT_RETRIES = int(os.getenv("MAX_TRANSIENT_RETRIES", "10"))
 TRANSIENT_PAUSE = int(os.getenv("TRANSIENT_PAUSE", "30"))  # seconds before re-checking 5xx pages
 BROWSER_TIMEOUT = 45000    # ms
+
+# Contact-form audit: does every page carry a lead form?
+CONTACT_FORM_CHECK = os.getenv("CONTACT_FORM_CHECK", "true").lower() != "false"
+CONTACT_FORM_REQUIRED = os.getenv("CONTACT_FORM_REQUIRED", "false").lower() == "true"
+MAX_FORM_PAGES_LISTED = 40   # per site, keeps the report readable
+
+# Screenshot of each website's contact form, attached to the hourly email.
+CONTACT_FORM_SHOT = os.getenv("CONTACT_FORM_SHOT", "true").lower() != "false"
+SHOT_WIDTH = int(os.getenv("SHOT_WIDTH", "900"))        # browser width while shooting
+SHOT_QUALITY = int(os.getenv("SHOT_QUALITY", "70"))     # jpeg quality, keeps the mail small
 SETTLE_SECONDS = 3.0       # how long to watch the page until the text stops growing
 NAV_TIMEOUT = 45
 
@@ -257,15 +284,115 @@ MEASURE_JS = r"""
 """
 
 
-def text_from_html(html):
+# Markers left in the HTML by the form plugins used on WordPress sites. Checked before
+# the <form> scan because many of these render their fields with JavaScript.
+FORM_PLUGIN_MARKERS = (
+    "wpcf7", "wpforms", "gform_", "gform_wrapper", "gravityforms", "ninja_forms", "nf-form",
+    "elementor-form", "fluentform", "forminator", "caldera", "hs-form", "hbspt.forms",
+    "wp-block-jetpack-contact-form", "mc4wp", "typeform", "jotform", "formstack",
+    "contact-form-7", "contact_form_7", "wpcargo", "strong-forms", "quform", "cf7",
+)
+
+# Inputs that make a <form> a lead form rather than a search box or a newsletter toggle.
+CONTACT_INPUT_HINTS = ("email", "mail", "phone", "tel", "mobile", "name", "message",
+                       "enquir", "inquir", "comment", "subject", "postcode")
+
+
+def form_looks_like_contact(form):
+    """True when this <form> asks for the kind of data a lead form asks for.
+
+    Search boxes are excluded on purpose: almost every WordPress header carries one,
+    and counting it would hide the pages that really have no lead form.
+    """
+    fields = [f for f in form.find_all(["input", "select", "textarea"])
+              if (f.get("type") or "").lower() not in ("submit", "button", "reset", "image", "hidden")]
+    if not fields:
+        return False
+    is_search = all(
+        (f.get("type") or "").lower() == "search"
+        or (f.get("name") or "").lower() in ("s", "search", "q", "query", "keyword", "keywords")
+        for f in fields
+    )
+    if is_search:
+        return False
+    if form.find("textarea"):
+        return True
+    for field in form.find_all(["input", "select"]):
+        ftype = (field.get("type") or "text").lower()
+        if ftype in ("email", "tel"):
+            return True
+        if ftype in ("hidden", "submit", "button", "search", "reset", "image", "file"):
+            continue
+        blob = " ".join(str(field.get(k) or "") for k in ("name", "id", "placeholder", "aria-label")).lower()
+        if any(hint in blob for hint in CONTACT_INPUT_HINTS):
+            return True
+    return False
+
+
+# A form plugin shortcode left unprocessed by WordPress: the visitor sees this text
+# instead of a form. capitalautocarremovals.com.au/contact/ shows
+# [contact-form-7 id="edc096b" title="Home Form"] exactly like this.
+BROKEN_FORM_SHORTCODE = re.compile(
+    r"\[\s*(contact-form-7|contact-form|wpforms|gravityform|gravityforms|ninja_form|"
+    r"ninja-forms|formidable|caldera_form|fluentform|forminator|quform|strong-forms)"
+    r"[^\]]{0,140}\]",
+    re.IGNORECASE,
+)
+
+
+def find_broken_form_shortcode(text):
+    """Return the raw shortcode that the page printed instead of a form, else ''."""
+    m = BROKEN_FORM_SHORTCODE.search(text or "")
+    return m.group(0)[:160] if m else ""
+
+
+def parse_html(html):
+    """BeautifulSoup parse that never raises (real pages contain broken markup)."""
+    try:
+        return BeautifulSoup(html or "", "html.parser")
+    except Exception:
+        return None
+
+
+def detect_contact_form(html=None, soup=None):
+    """Does this page really contain a contact form? -> (bool, reason).
+
+    Only real fields count. Never the string "wpcf7" on its own: sites that load the
+    Contact Form 7 stylesheet but render NO form (capitalautocarremovals.com.au is
+    one) would otherwise be reported as having a form they do not have.
+    """
+    if soup is None:
+        soup = parse_html(html)
+    if soup is None:
+        return False, ""
+    try:
+        for form in soup.find_all("form"):
+            if form_looks_like_contact(form):
+                return True, "form element"
+        # a form plugin container that holds real fields (its <form> may be injected later)
+        for el in soup.find_all(attrs={"class": True}):
+            classes = " ".join(el.get("class") or []).lower()
+            if not any(m in classes for m in FORM_PLUGIN_MARKERS):
+                continue
+            fields = [f for f in el.find_all(["input", "select", "textarea"])
+                      if (f.get("type") or "").lower() not in
+                      ("submit", "button", "reset", "image", "hidden")]
+            if fields:
+                return True, f"plugin:{classes.split()[0]}"
+    except Exception:
+        pass
+    return False, ""
+
+
+def text_from_html(html, soup=None):
     """Visible-ish text from raw HTML (no browser). Cheap first pass.
 
     Defensive on purpose: real pages contain broken markup, and one malformed tag
     must never abort the whole monitoring job.
     """
-    try:
-        soup = BeautifulSoup(html, "html.parser")
-    except Exception:
+    if soup is None:
+        soup = parse_html(html)
+    if soup is None:
         return ""
     for tag in NON_TEXT_TAGS:
         try:
@@ -312,7 +439,7 @@ def fetch(url, retries=RETRIES):
     for attempt in range(retries + 1):
         start = time.time()
         try:
-            r = session.get(url, timeout=TIMEOUT, allow_redirects=True)
+            r = session.get(url, timeout=timeout_for(url), allow_redirects=True)
             if r.status_code in RETRY_STATUS and attempt < retries:
                 wait = r.headers.get("Retry-After", "")
                 time.sleep(min(int(wait), 20) if wait.isdigit() else 4 * (attempt + 1))
@@ -347,7 +474,8 @@ def _check_page(url):
         # us (too many parallel requests), occasionally a real outage. Never call this a
         # white screen without checking what a browser gets.
         body = text_from_html(r.text or "")
-        return {"url": url, "ok": False, "suspect": True,
+        form, _ = detect_contact_form(r.text or "") if CONTACT_FORM_CHECK else (False, "")
+        return {"url": url, "ok": False, "suspect": True, "form": form,
                 "http_sample": body[:200], "http_len": len(body), "http_status": r.status_code,
                 "problem": f"SERVER ERROR - HTTP {r.status_code} from the server"}
 
@@ -377,15 +505,26 @@ def _check_page(url):
         return {"url": url, "ok": False, "suspect": True,
                 "problem": f"WHITE SCREEN - body almost empty ({len(html.strip())} bytes)"}
 
-    text = text_from_html(html)
+    soup = parse_html(html)
+    form, form_why = detect_contact_form(html, soup=soup) if CONTACT_FORM_CHECK else (False, "")
+    text = text_from_html(html, soup=soup)
     if len(text) >= MIN_VISIBLE_TEXT:
+        broken = find_broken_form_shortcode(text) if CONTACT_FORM_CHECK else ""
+        if broken:
+            return {"url": url, "ok": False, "suspect": False, "form": False,
+                    "form_why": "raw shortcode",
+                    "http_sample": text[:200], "http_len": len(text),
+                    "problem": f"CONTACT FORM BROKEN - the page shows the raw shortcode "
+                               f"{broken} instead of a form"}
         return {"url": url, "ok": True, "suspect": False, "problem": "",
+                "form": form, "form_why": form_why,
                 "http_sample": text[:200], "http_len": len(text)}
 
     # Short text over plain HTTP: could be a JS app, a WAF notice, or a real white screen.
     # Do not judge it yet - send it to the browser for verification.
     return {"url": url, "ok": False, "suspect": True, "http_text": text,
             "http_sample": text[:200], "http_len": len(text),
+            "form": form, "form_why": form_why,
             "problem": f"WHITE SCREEN - only {len(text)} characters of visible text"}
 
 
@@ -440,7 +579,8 @@ def browser_probe(url):
     info = {"url": url, "status": None, "chars": 0, "words": 0, "sample": "",
             "hidden": 0, "error": "", "headers": {}}
     try:
-        response = page.goto(url, wait_until="domcontentloaded", timeout=BROWSER_TIMEOUT)
+        response = page.goto(url, wait_until="domcontentloaded",
+                             timeout=SLOW_BROWSER_TIMEOUT if is_slow(url) else BROWSER_TIMEOUT)
         info["status"] = response.status if response else None
         if response is not None:
             try:
@@ -492,6 +632,9 @@ def browser_probe(url):
         info["chars"] = int(measured.get("chars", 0))
         info["words"] = int(measured.get("words", 0))
         info["hidden"] = int(measured.get("hiddenChars", 0))
+        info["contact_form"] = bool(measured.get("contactForm"))
+        info["broken_shortcode"] = measured.get("brokenShortcode", "")
+        info["forms"] = int(measured.get("forms", 0))
         info["sample"] = (measured.get("sample") or "")[:250]
     except Exception as e:
         info["error"] = f"{type(e).__name__}: {str(e).splitlines()[0][:160]}"
@@ -543,6 +686,121 @@ def verify_with_browser(urls, label="", workers=None):
     return collected
 
 
+def _pick_form_pages(urls):
+    """Order the site's pages by how likely they are to show the contact form."""
+    def score(u):
+        path = urlparse(u).path.lower()
+        if "contact" in path:
+            return 0
+        if any(k in path for k in ("quote", "enquir", "get-in-touch", "getintouch")):
+            return 1
+        if path in ("", "/"):
+            return 2
+        return 3
+    return sorted(urls, key=score)[:4]
+
+
+def capture_form_image(urls, out_dir):
+    """Screenshot the contact form of one website for the email.
+
+    Returns {"file": ..., "page": ..., "found": bool, "note": str} or None.
+    Never raises: a missing picture must not fail the site check.
+    """
+    if not urls or not CONTACT_FORM_SHOT:
+        return None
+    host = urlparse(urls[0]).netloc
+    target = os.path.join(out_dir, "form-" + host.replace(":", "_") + ".jpg")
+    try:
+        page = _browser().new_page(viewport={"width": SHOT_WIDTH, "height": 1000})
+    except Exception as e:
+        print(f"  (no form screenshot: browser unavailable - {type(e).__name__})")
+        return None
+    try:
+        page.set_default_timeout(SLOW_BROWSER_TIMEOUT if is_slow(urls[0]) else BROWSER_TIMEOUT)
+        for url in _pick_form_pages(urls):
+            try:
+                page.goto(url, wait_until="domcontentloaded",
+                          timeout=SLOW_BROWSER_TIMEOUT if is_slow(url) else BROWSER_TIMEOUT)
+                page.wait_for_timeout(1500)
+            except Exception:
+                continue
+            geo = page.evaluate("""() => {
+                const usable = f => {
+                  const r = f.getBoundingClientRect(); const cs = getComputedStyle(f);
+                  if (cs.display === 'none' || cs.visibility === 'hidden' || +cs.opacity < 0.05) return false;
+                  if (r.width < 60 || r.height < 40) return false;
+                  return f.querySelectorAll('input:not([type=hidden]), textarea, select').length > 0;
+                };
+                const rect = el => {
+                  const r = el.getBoundingClientRect();
+                  return {x: r.left + window.scrollX, y: r.top + window.scrollY,
+                          w: r.width, h: r.height};
+                };
+                const forms = [...document.querySelectorAll('form')].filter(usable);
+                if (forms.length) {
+                  const lead = forms.find(f => f.querySelector('textarea, input[type=email], input[type=tel]'));
+                  const form = lead || forms[0];
+                  let box = rect(form);
+                  // grow to the surrounding card/section so the picture has context
+                  let node = form.parentElement, best = box;
+                  for (let i = 0; i < 5 && node && node !== document.body; i++) {
+                    const b = rect(node);
+                    if (b.w > box.w + 20 && b.h < box.h * 2.2 && b.h < 1500) best = b;
+                    node = node.parentElement;
+                  }
+                  return {box: best, found: true};
+                }
+                const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+                let n;
+                while ((n = walker.nextNode())) {
+                  if (/\\[\\s*(contact-form-7|wpforms|gravityform|ninja_form|fluentform|forminator)/i.test(n.textContent)) {
+                    let el = n.parentElement, best = rect(el);
+                    for (let i = 0; i < 4 && el && el !== document.body; i++) {
+                      const b = rect(el);
+                      if (b.w > best.w && b.h < 900) best = b;
+                      el = el.parentElement;
+                    }
+                    return {box: best, found: false};
+                  }
+                }
+                return {box: null, found: false};
+            }""")
+            box = (geo or {}).get("box")
+            if box and box["w"] > 60 and box["h"] > 40:
+                page_width = page.evaluate("() => document.documentElement.scrollWidth")
+                pad = 28
+                x = max(0, box["x"] - pad)
+                y = max(0, box["y"] - pad)
+                w = min(page_width - x, max(640, box["w"] + pad * 2))
+                h = min(max(360, box["h"] + pad * 2), 1600)
+                try:
+                    page.screenshot(path=target, full_page=True, type="jpeg", quality=SHOT_QUALITY,
+                                    clip={"x": x, "y": y, "width": w, "height": h})
+                except Exception:
+                    page.screenshot(path=target, type="jpeg", quality=SHOT_QUALITY, full_page=False)
+                found = bool((geo or {}).get("found"))
+                print(f"  contact form image: {target} ({'form found' if found else 'no form'}) - {url}")
+                return {"file": os.path.basename(target), "page": url,
+                        "found": found, "note": "form" if found else "no form on this page"}
+        # nothing form-like: shoot the top of the page as evidence
+        try:
+            page.goto(urls[0], wait_until="domcontentloaded",
+                      timeout=SLOW_BROWSER_TIMEOUT if is_slow(urls[0]) else BROWSER_TIMEOUT)
+            page.wait_for_timeout(1200)
+            page.screenshot(path=target, type="jpeg", quality=SHOT_QUALITY, full_page=False)
+            print(f"  contact form image: {target} (page only, no form found)")
+            return {"file": os.path.basename(target), "page": urls[0], "found": False,
+                    "note": "no contact form found on the page checked"}
+        except Exception as e:
+            print(f"  (no form screenshot: {type(e).__name__})")
+            return None
+    finally:
+        try:
+            page.close()
+        except Exception:
+            pass
+
+
 def resolve_suspect(result, probe):
     """Turn an HTTP result + its browser probe into a final verdict.
 
@@ -553,12 +811,21 @@ def resolve_suspect(result, probe):
     problem = result["problem"]
     info = {"url": url,
             "http_sample": result.get("http_sample", ""),
-            "http_len": result.get("http_len", 0)}
+            "http_len": result.get("http_len", 0),
+            "form": bool(result.get("form")),
+            "form_why": result.get("form_why", "")}
+    broken_shortcode = (probe or {}).get("broken_shortcode", "") or \
+                       (find_broken_form_shortcode(result.get("http_text", ""))
+                        if CONTACT_FORM_CHECK else "")
     if result.get("http_status"):
         info["http_status"] = result["http_status"]
     if probe:
         info["browser_sample"] = probe.get("sample", "")
         info["browser_chars"] = probe.get("chars", 0)
+        # the browser sees forms that JavaScript injects, so trust it when it found one
+        if probe.get("contact_form"):
+            info["form"] = True
+            info["form_why"] = info.get("form_why") or "rendered form"
 
     if probe and probe.get("error"):
         # browser could not load it at all - keep the HTTP wording, add the reason
@@ -585,6 +852,11 @@ def resolve_suspect(result, probe):
             return info
 
         if probe["chars"] >= MIN_VISIBLE_TEXT and not sig:
+            if broken_shortcode:
+                info.update(ok=False, form=False, form_why="raw shortcode",
+                            problem=(f"CONTACT FORM BROKEN - the page shows the raw "
+                                     f"shortcode {broken_shortcode} instead of a form"))
+                return info
             # the page renders fine for a real browser: JS-rendered, not broken
             info.update(ok=True, problem="", js_rendered=True)
             return info
@@ -722,7 +994,7 @@ def diagnose(url):
     """Show exactly what this machine/runner is served - HTTP view and browser view."""
     print(f"DIAGNOSE {url}\n" + "-" * 70)
     try:
-        r = session.get(url, timeout=TIMEOUT, allow_redirects=True)
+        r = session.get(url, timeout=timeout_for(url), allow_redirects=True)
         raw = text_from_html(r.text or "")
         print(f"HTTP      status={r.status_code} bytes={len(r.content or b'')} "
               f"type={r.headers.get('Content-Type', '?')}")
@@ -885,16 +1157,51 @@ def main():
         if cluster:
             bad = []
 
-        problems += (1 if cluster else len(bad))
-        entry["problems"] = 1 if cluster else len(bad)
-        print(f"[{'ISSUES' if (bad or cluster) else 'OK'}] {site}: {len(pages)} pages, "
-              f"{(1 if cluster else len(bad))} problems")
-        report.append(f"{site}\n  Pages checked: {len(pages)}  |  Problems: {1 if cluster else len(bad)}")
+        # contact-form audit (counted as a problem only when CONTACT_FORM_REQUIRED=true)
+        no_form = [u for u in pages if not by_url[u].get("form")]
+        form_problems = len(no_form) if (CONTACT_FORM_CHECK and CONTACT_FORM_REQUIRED) else 0
+        # A site where NOT ONE page has a form is broken, not a judgement call: always report it.
+        whole_site_no_form = (CONTACT_FORM_CHECK and len(pages) > 0
+                              and len(no_form) == len(pages) and not cluster)
+        if whole_site_no_form:
+            form_problems += 1
+        site_problems = (1 if cluster else len(bad)) + form_problems
+
+        problems += site_problems
+        entry["problems"] = site_problems
+        entry["with_form"] = len(pages) - len(no_form)
+        entry["no_form_count"] = len(no_form)
+        entry["no_form"] = no_form[:MAX_FORM_PAGES_LISTED]
+
+        print(f"[{'ISSUES' if site_problems else 'OK'}] {site}: {len(pages)} pages, "
+              f"{site_problems} problems"
+              + (f", {len(no_form)} without a contact form" if len(no_form) else ""))
+        report.append(f"{site}\n  Pages checked: {len(pages)}  |  Problems: {site_problems}")
+        if CONTACT_FORM_CHECK and len(pages):
+            report.append(f"  Contact form: {len(pages) - len(no_form)} of {len(pages)} pages")
+        if whole_site_no_form:
+            where = f"https://{urlparse(pages[0]).netloc}/"
+            entry["items"].append({
+                "url": where,
+                "problem": f"NO CONTACT FORM - none of the {len(pages)} pages on this website "
+                           f"has a lead/contact form (quote buttons point at a form that is not there)",
+            })
+            report.append(f"  X {where}\n      NO CONTACT FORM on any of the {len(pages)} pages")
 
         recovered = sum(1 for u in pages if u in flaky)
         if recovered:
             entry["notes"].append(f"{recovered} page(s) gave a temporary server error but worked on re-check.")
             report.append(f"  ({recovered} page(s) gave a temporary server error but worked on re-check)")
+
+        if CONTACT_FORM_CHECK and no_form:
+            if CONTACT_FORM_REQUIRED:
+                for u in no_form[:MAX_LISTED_PER_SITE]:
+                    entry["items"].append({"url": u, "problem": "No contact form on this page"})
+                    report.append(f"    X {u}\n      No contact form on this page")
+            else:
+                report.append(f"  NO CONTACT FORM ({len(no_form)} page(s))")
+                for u in no_form[:MAX_FORM_PAGES_LISTED]:
+                    report.append(f"    - {u}")
 
         js_rendered = sum(1 for u in pages if by_url[u].get("js_rendered"))
         if js_rendered:
@@ -931,6 +1238,24 @@ def main():
         if len(bad) > MAX_LISTED_PER_SITE:
             report.append(f"    ... and {len(bad) - MAX_LISTED_PER_SITE} more (see GitHub Actions log)")
         report.append("")
+
+    # 5) One picture of each website's contact form, for the email
+    if CONTACT_FORM_SHOT and os.getenv("REPORT_DIR") and sites_payload:
+        out_dir = os.environ["REPORT_DIR"]
+        os.makedirs(out_dir, exist_ok=True)
+        for entry in sites_payload:
+            if entry.get("down"):
+                continue
+            site_urls = sites.get(entry["url"]) or []
+            try:
+                shot = capture_form_image(site_urls, out_dir)
+            except Exception as e:            # a picture must never break the check
+                print(f"  (no form screenshot: {type(e).__name__}: {str(e)[:100]})")
+                shot = None
+            if shot:
+                entry["form_image"] = shot["file"]
+                entry["form_image_page"] = shot["page"]
+                entry["form_image_found"] = shot["found"]
 
     names = ", ".join(urlparse(x).netloc for x in sites)
     took = int(time.time() - started)
