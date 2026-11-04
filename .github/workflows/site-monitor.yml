@@ -31,12 +31,22 @@ jobs:
       fail-fast: false            # one site failing never stops the others
       matrix:
         site:
+          # capital auto is the priority site: checked first, with a longer timeout below
+          - capitalautocarremovals.com.au
           - scrapcarremovalqld.com.au
           - 5starcashforcars.com.au
           - instantcarremoval.com.au
           - instantcarremovalsydney.com.au
           - instantcarremovalqld.com.au
           - icarpetcleanandpestcontrol.com.au
+          - aegcashforcars.com.au
+          - canberrawreckers.com.au
+          - cashforcarzzz.com.au
+          - cashforunwantedcarsperth.com.au
+          - pulsedigitalagency.com.au
+          - queanbeyancashforcars.com.au
+          - scrapmycarcanberra.com.au
+          - zeematgroup.com.au
     steps:
       - uses: actions/checkout@v4
 
@@ -73,6 +83,12 @@ jobs:
           BROWSER_WORKERS: "1"        # one browser at a time - gentlest option
           MAX_BROWSER_CHECKS: "12"    # how many suspicious pages get a browser check
           TRANSIENT_PAUSE: "30"       # pause before re-checking pages that answered 5xx
+          SLOW_HOSTS: "capitalautocarremovals.com.au"   # hosts that need longer than 20 s to answer
+          SLOW_TIMEOUT: "90"          # seconds allowed for those hosts (it often needs ~60 s)
+          CONTACT_FORM_CHECK: "true"  # record, for every page, whether a contact form exists
+          CONTACT_FORM_SHOT: "true"   # take one picture of each site's contact form for the email
+          SHOT_QUALITY: "70"          # jpeg quality of those pictures (keeps the mail small)
+          CONTACT_FORM_REQUIRED: "false"  # "true" = a page without a contact form counts as a problem
         run: python check_sites.py pages.txt ${{ matrix.site }}
 
       - name: Save report
@@ -132,7 +148,7 @@ jobs:
           MAIL_TO: ${{ secrets.MAIL_TO }}
           SEND_OK_EMAIL: "true"       # "false" = email only when something is broken
           EMAIL_FORMAT: "html"        # "text" = plain-text email only (use this if HTML lands in Spam)
-          EXPECTED: "scrapcarremovalqld.com.au,5starcashforcars.com.au,instantcarremoval.com.au,instantcarremovalsydney.com.au,instantcarremovalqld.com.au,icarpetcleanandpestcontrol.com.au"
+          EXPECTED: "capitalautocarremovals.com.au,scrapcarremovalqld.com.au,5starcashforcars.com.au,instantcarremoval.com.au,instantcarremovalsydney.com.au,instantcarremovalqld.com.au,icarpetcleanandpestcontrol.com.au,aegcashforcars.com.au,canberrawreckers.com.au,cashforcarzzz.com.au,cashforunwantedcarsperth.com.au,pulsedigitalagency.com.au,queanbeyancashforcars.com.au,scrapmycarcanberra.com.au,zeematgroup.com.au"
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           DEDUPE_HOUR: "true"         # at most one email per hour, even if triggered twice
         run: python combine_report.py ${{ inputs.force_email && '--force' || '' }}
