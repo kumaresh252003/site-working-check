@@ -131,6 +131,7 @@ jobs:
           SMTP_PASS: ${{ secrets.SMTP_PASS }}
           MAIL_TO: ${{ secrets.MAIL_TO }}
           SEND_OK_EMAIL: "true"       # "false" = email only when something is broken
+          EMAIL_FORMAT: "html"        # "text" = plain-text email only (use this if HTML lands in Spam)
           EXPECTED: "scrapcarremovalqld.com.au,5starcashforcars.com.au,instantcarremoval.com.au,instantcarremovalsydney.com.au,instantcarremovalqld.com.au,icarpetcleanandpestcontrol.com.au"
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           DEDUPE_HOUR: "true"         # at most one email per hour, even if triggered twice
