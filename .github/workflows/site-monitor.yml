@@ -83,6 +83,7 @@ jobs:
           BROWSER_WORKERS: "1"        # one browser at a time - gentlest option
           MAX_BROWSER_CHECKS: "12"    # how many suspicious pages get a browser check
           TRANSIENT_PAUSE: "30"       # pause before re-checking pages that answered 5xx
+          EXTERNAL_READER: "true"     # when a host refuses our IP, confirm with an outside reader
           SLOW_HOSTS: "capitalautocarremovals.com.au"   # hosts that need longer than 20 s to answer
           SLOW_TIMEOUT: "90"          # seconds allowed for those hosts (it often needs ~60 s)
           CONTACT_FORM_CHECK: "true"  # look for a contact form on each site's HOMEPAGE
