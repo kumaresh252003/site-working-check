@@ -100,9 +100,6 @@ MAX_TRANSIENT_RETRIES = int(os.getenv("MAX_TRANSIENT_RETRIES", "10"))
 TRANSIENT_PAUSE = int(os.getenv("TRANSIENT_PAUSE", "30"))  # seconds before re-checking 5xx pages
 BROWSER_TIMEOUT = 45000    # ms
 
-# Contact-form audit: does every page carry a lead form?
-CONTACT_FORM_CHECK = os.getenv("CONTACT_FORM_CHECK", "true").lower() != "false"
-CONTACT_FORM_REQUIRED = os.getenv("CONTACT_FORM_REQUIRED", "false").lower() == "true"
 
 
 SETTLE_SECONDS = 3.0       # how long to watch the page until the text stops growing
@@ -282,104 +279,12 @@ MEASURE_JS = r"""
 """
 
 
-# Markers left in the HTML by the form plugins used on WordPress sites. Checked before
-# the <form> scan because many of these render their fields with JavaScript.
-FORM_PLUGIN_MARKERS = (
-    "wpcf7", "wpforms", "gform_", "gform_wrapper", "gravityforms", "ninja_forms", "nf-form",
-    "elementor-form", "fluentform", "forminator", "caldera", "hs-form", "hbspt.forms",
-    "wp-block-jetpack-contact-form", "mc4wp", "typeform", "jotform", "formstack",
-    "contact-form-7", "contact_form_7", "wpcargo", "strong-forms", "quform", "cf7",
-)
-
-# Inputs that make a <form> a lead form rather than a search box or a newsletter toggle.
-CONTACT_INPUT_HINTS = ("email", "mail", "phone", "tel", "mobile", "name", "message",
-                       "enquir", "inquir", "comment", "subject", "postcode")
-
-
-def form_looks_like_contact(form):
-    """True when this <form> asks for the kind of data a lead form asks for.
-
-    Search boxes are excluded on purpose: almost every WordPress header carries one,
-    and counting it would hide the pages that really have no lead form.
-    """
-    fields = [f for f in form.find_all(["input", "select", "textarea"])
-              if (f.get("type") or "").lower() not in ("submit", "button", "reset", "image", "hidden")]
-    if not fields:
-        return False
-    is_search = all(
-        (f.get("type") or "").lower() == "search"
-        or (f.get("name") or "").lower() in ("s", "search", "q", "query", "keyword", "keywords")
-        for f in fields
-    )
-    if is_search:
-        return False
-    if form.find("textarea"):
-        return True
-    for field in form.find_all(["input", "select"]):
-        ftype = (field.get("type") or "text").lower()
-        if ftype in ("email", "tel"):
-            return True
-        if ftype in ("hidden", "submit", "button", "search", "reset", "image", "file"):
-            continue
-        blob = " ".join(str(field.get(k) or "") for k in ("name", "id", "placeholder", "aria-label")).lower()
-        if any(hint in blob for hint in CONTACT_INPUT_HINTS):
-            return True
-    return False
-
-
-# A form plugin shortcode left unprocessed by WordPress: the visitor sees this text
-# instead of a form. capitalautocarremovals.com.au/contact/ shows
-# [contact-form-7 id="edc096b" title="Home Form"] exactly like this.
-BROKEN_FORM_SHORTCODE = re.compile(
-    r"\[\s*(contact-form-7|contact-form|wpforms|gravityform|gravityforms|ninja_form|"
-    r"ninja-forms|formidable|caldera_form|fluentform|forminator|quform|strong-forms)"
-    r"[^\]]{0,140}\]",
-    re.IGNORECASE,
-)
-
-
-def find_broken_form_shortcode(text):
-    """Return the raw shortcode that the page printed instead of a form, else ''."""
-    m = BROKEN_FORM_SHORTCODE.search(text or "")
-    return m.group(0)[:160] if m else ""
-
-
 def parse_html(html):
     """BeautifulSoup parse that never raises (real pages contain broken markup)."""
     try:
         return BeautifulSoup(html or "", "html.parser")
     except Exception:
         return None
-
-
-def detect_contact_form(html=None, soup=None):
-    """Does this page really contain a contact form? -> (bool, reason).
-
-    Only real fields count. Never the string "wpcf7" on its own: sites that load the
-    Contact Form 7 stylesheet but render NO form (capitalautocarremovals.com.au is
-    one) would otherwise be reported as having a form they do not have.
-    """
-    if soup is None:
-        soup = parse_html(html)
-    if soup is None:
-        return False, ""
-    try:
-        for form in soup.find_all("form"):
-            if form_looks_like_contact(form):
-                return True, "form element"
-        # a form plugin container that holds real fields (its <form> may be injected later)
-        for el in soup.find_all(attrs={"class": True}):
-            classes = " ".join(el.get("class") or []).lower()
-            if not any(m in classes for m in FORM_PLUGIN_MARKERS):
-                continue
-            fields = [f for f in el.find_all(["input", "select", "textarea"])
-                      if (f.get("type") or "").lower() not in
-                      ("submit", "button", "reset", "image", "hidden")]
-            if fields:
-                return True, f"plugin:{classes.split()[0]}"
-    except Exception:
-        pass
-    return False, ""
 
 
 def text_from_html(html, soup=None):
@@ -493,8 +398,7 @@ def _check_page(url):
         # us (too many parallel requests), occasionally a real outage. Never call this a
         # white screen without checking what a browser gets.
         body = text_from_html(r.text or "")
-        form, _ = detect_contact_form(r.text or "") if CONTACT_FORM_CHECK else (False, "")
-        return {"url": url, "ok": False, "suspect": True, "form": form,
+        return {"url": url, "ok": False, "suspect": True,
                 "http_sample": body[:200], "http_len": len(body), "http_status": r.status_code,
                 "problem": f"SERVER ERROR - HTTP {r.status_code} from the server"}
 
@@ -525,29 +429,15 @@ def _check_page(url):
                 "problem": f"WHITE SCREEN - body almost empty ({len(html.strip())} bytes)"}
 
     soup = parse_html(html)
-    # the form question is only asked of the homepage - every other page is still
-    # checked for white screens, error text and unprocessed form shortcodes
-    is_home = urlparse(url).path in ("", "/")
-    form, form_why = (detect_contact_form(html, soup=soup)
-                      if (CONTACT_FORM_CHECK and is_home) else (None, ""))
     text = text_from_html(html, soup=soup)
     if len(text) >= MIN_VISIBLE_TEXT:
-        broken = find_broken_form_shortcode(text) if CONTACT_FORM_CHECK else ""
-        if broken:
-            return {"url": url, "ok": False, "suspect": False, "form": False,
-                    "form_why": "raw shortcode",
-                    "http_sample": text[:200], "http_len": len(text),
-                    "problem": f"CONTACT FORM BROKEN - the page shows the raw shortcode "
-                               f"{broken} instead of a form"}
         return {"url": url, "ok": True, "suspect": False, "problem": "",
-                "form": form, "form_why": form_why,
                 "http_sample": text[:200], "http_len": len(text)}
 
     # Short text over plain HTTP: could be a JS app, a WAF notice, or a real white screen.
     # Do not judge it yet - send it to the browser for verification.
     return {"url": url, "ok": False, "suspect": True, "http_text": text,
             "http_sample": text[:200], "http_len": len(text),
-            "form": form, "form_why": form_why,
             "problem": f"WHITE SCREEN - only {len(text)} characters of visible text"}
 
 
@@ -655,9 +545,9 @@ def browser_probe(url):
         info["chars"] = int(measured.get("chars", 0))
         info["words"] = int(measured.get("words", 0))
         info["hidden"] = int(measured.get("hiddenChars", 0))
-        info["contact_form"] = bool(measured.get("contactForm"))
-        info["broken_shortcode"] = measured.get("brokenShortcode", "")
-        info["forms"] = int(measured.get("forms", 0))
+
+
+
         info["sample"] = (measured.get("sample") or "")[:250]
     except Exception as e:
         info["error"] = f"{type(e).__name__}: {str(e).splitlines()[0][:160]}"
@@ -719,21 +609,12 @@ def resolve_suspect(result, probe):
     problem = result["problem"]
     info = {"url": url,
             "http_sample": result.get("http_sample", ""),
-            "http_len": result.get("http_len", 0),
-            "form": bool(result.get("form")),
-            "form_why": result.get("form_why", "")}
-    broken_shortcode = (probe or {}).get("broken_shortcode", "") or \
-                       (find_broken_form_shortcode(result.get("http_text", ""))
-                        if CONTACT_FORM_CHECK else "")
+            "http_len": result.get("http_len", 0)}
     if result.get("http_status"):
         info["http_status"] = result["http_status"]
     if probe:
         info["browser_sample"] = probe.get("sample", "")
         info["browser_chars"] = probe.get("chars", 0)
-        # the browser sees forms that JavaScript injects, so trust it when it found one
-        if probe.get("contact_form"):
-            info["form"] = True
-            info["form_why"] = info.get("form_why") or "rendered form"
 
     if probe and probe.get("error"):
         # browser could not load it at all - keep the HTTP wording, add the reason
@@ -760,11 +641,6 @@ def resolve_suspect(result, probe):
             return info
 
         if probe["chars"] >= MIN_VISIBLE_TEXT and not sig:
-            if broken_shortcode:
-                info.update(ok=False, form=False, form_why="raw shortcode",
-                            problem=(f"CONTACT FORM BROKEN - the page shows the raw "
-                                     f"shortcode {broken_shortcode} instead of a form"))
-                return info
             # the page renders fine for a real browser: JS-rendered, not broken
             info.update(ok=True, problem="", js_rendered=True)
             return info
@@ -1079,8 +955,6 @@ def main():
                  "problems": 0, "items": [], "notes": [], "down": False}
         sites_payload.append(entry)
         if site in refused_only:
-            entry["home_form"] = None          # pages were not checked, so no form verdict
-            entry["home_url"] = site + "/"
             entry["notes"].append(
                 f"Note: the host refused our checker's connection, but the website answered "
                 f"{refused_only[site]} - it is up. Its pages could not be checked one by one "
@@ -1105,34 +979,14 @@ def main():
         if cluster:
             bad = []
 
-        # contact form: homepage only -------------------------------------------------
-        home = next((u for u in pages if urlparse(u).path in ("", "/")), None)
-        home_form = None
-        if CONTACT_FORM_CHECK and home is not None:
-            home_form = bool(by_url[home].get("form"))
-        form_problem = (1 if (CONTACT_FORM_CHECK and CONTACT_FORM_REQUIRED
-                              and home_form is False) else 0)
-        site_problems = (1 if cluster else len(bad)) + form_problem
+        site_problems = 1 if cluster else len(bad)
 
         problems += site_problems
         entry["problems"] = site_problems
-        entry["home_form"] = home_form
-        entry["home_url"] = home or site
 
         print(f"[{'ISSUES' if site_problems else 'OK'}] {site}: {len(pages)} pages, "
-              f"{site_problems} problems"
-              + ("" if home_form is None else
-                 (", form on homepage" if home_form else ", NO form on homepage")))
+              f"{site_problems} problems")
         report.append(f"{site}\n  Pages checked: {len(pages)}  |  Problems: {site_problems}")
-        if home_form is not None:
-            report.append("  Contact form on homepage: " + ("yes" if home_form else "NO"))
-            if home_form is False and CONTACT_FORM_REQUIRED:
-                entry["items"].append({
-                    "url": home or site,
-                    "problem": "NO CONTACT FORM ON HOMEPAGE - visitors landing on the "
-                               "homepage have no form to fill in",
-                })
-                report.append(f"  X {home or site}\n      NO CONTACT FORM ON HOMEPAGE")
 
         recovered = sum(1 for u in pages if u in flaky)
         if recovered:
