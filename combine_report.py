@@ -64,16 +64,38 @@ def status_mark(site):
 
 
 def error_lines(ctx):
-    """Plain-text style list of everything that went wrong, site by site."""
-    lines = []
+    """Plain-text style list of everything that went wrong, site by site (no repeats)."""
+    lines, seen = [], set()
+
+    def add(where, what):
+        key = (where, what)
+        if key in seen:              # the same line twice in one email helps nobody
+            return
+        seen.add(key)
+        lines.append(key)
+
     for s in ctx["sites"]:
         name = s.get("site") or ""
+        notes = list(s.get("notes") or [])
         if s.get("down"):
-            lines.append((name, (s.get("notes") or ["Site unreachable"])[0]))
-        for note in s.get("notes") or []:
-            lines.append((name, note))
+            add(name, notes[0] if notes else "Site unreachable")
         for item in s.get("items") or []:
-            lines.append((item.get("url", ""), item.get("problem", "")))
+            add(item.get("url", ""), item.get("problem", ""))
+    return lines
+
+
+def note_lines(ctx):
+    """Extra information about a site that is not a problem (kept out of ERRORS)."""
+    lines, seen = [], set()
+    for s in ctx["sites"]:
+        name = s.get("site") or ""
+        notes = list(s.get("notes") or [])
+        if s.get("down") and notes:
+            notes = notes[1:]        # the first note is already the "unreachable" line
+        for note in notes:
+            if (name, note) not in seen:
+                seen.add((name, note))
+                lines.append((name, note))
     return lines
 
 
@@ -111,6 +133,26 @@ def render_html(ctx):
             '<div style="margin-top:26px;font-size:13px;color:#555;">'
             "No errors. Every page returned content.</div>"
         )
+
+    notes = note_lines(ctx)
+    if notes:
+        note_blocks = "".join(
+            f'<div style="margin:0 0 12px;">'
+            f'<div style="font-size:12px;color:#000;">{esc(where)}</div>'
+            f'<div style="font-size:12px;line-height:1.6;color:#555;">{esc(what)}</div>'
+            f"</div>"
+            for where, what in notes
+        )
+        notes_html = (
+            '<div style="margin-top:26px;">'
+            '<div style="font-size:12px;font-weight:700;letter-spacing:1.4px;'
+            'text-transform:uppercase;color:#000;padding-bottom:8px;'
+            'border-bottom:1px solid #000;">Notes</div>'
+            f'<div style="padding-top:14px;">{note_blocks}</div>'
+            "</div>"
+        )
+    else:
+        notes_html = ""
 
     # contact form on the homepage (only when the checks reported it)
     form_sites = [x for x in ctx["sites"] if x.get("home_form") is not None]
@@ -177,6 +219,7 @@ def render_html(ctx):
    </td></tr>
 
    <tr><td>{errors_html}</td></tr>
+   <tr><td>{notes_html}</td></tr>
    <tr><td>{forms_html}</td></tr>
 
    <tr><td style="padding-top:26px;">
@@ -221,6 +264,12 @@ def render_text(ctx):
         for x in missing:
             lines.append(f"  {x.get('site','')} - no contact form on the homepage "
                          f"({x.get('home_url','')})")
+    notes = note_lines(ctx)
+    if notes:
+        lines += ["", "NOTES"]
+        for where, what in notes:
+            lines += [f"  {where}", f"    {what}"]
+
     lines += ["", "-- ", "site-working-check" + (f" | {ctx['run_url']}" if ctx.get("run_url") else "")]
     return "\n".join(lines)
 
